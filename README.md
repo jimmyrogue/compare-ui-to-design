@@ -3,73 +3,77 @@
 [![Tests](https://github.com/jimmyrogue/compare-ui-to-design/actions/workflows/test.yml/badge.svg)](https://github.com/jimmyrogue/compare-ui-to-design/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Audit UI/UX differences between a running interface and a design reference, then mark the exact regions that differ.
+Agent skill for auditing UI/UX differences between a running interface and a design reference, then marking the exact regions that differ.
 
-`compare-ui-to-design` is an agent-compatible skill for comparing web pages, simulator screenshots, real-device screenshots, Figma exports, and static design images. It is audit-only by default: it focuses on UI/UX implementation fidelity, including module position, size, border, color, background, gradient direction, spacing, margin, padding, typography metrics, icon/image size, and alignment.
+English | [中文](#中文)
 
-It does not try to report every pixel or every copy/data mismatch. Text values, timestamps, counters, fetched data, and labels are treated as context unless they affect layout, typography metrics, visual state, or component size.
+## What It Does
 
-It also calls out screen-edge and safe-area differences, which are easy to miss, while ignoring device/system UI chrome such as phone status bars, tablet menu bars, browser chrome, home indicators, and navigation bars unless the design explicitly includes them.
+`compare-ui-to-design` compares web pages, app screenshots, simulator captures, real-device screenshots, Figma exports, and static design images. It is audit-only by default: it identifies UI/UX implementation differences and does not modify application code unless you explicitly ask for fixes.
 
-## Skills
+The skill focuses on:
 
-| Skill | When | What it does |
-| :--- | :--- | :--- |
-| [`compare-ui-to-design`](skills/compare-ui-to-design/SKILL.md) | Running UI does not visually match a Figma/design reference | Captures or accepts screenshots, runs visual diff tooling when possible, marks UI/UX difference regions, and reports precise coordinates. |
+- Module position, size, alignment, clipping, and z-order
+- Border, radius, shadow, divider, background, color, opacity, and gradient direction
+- Spacing, margin, padding, gap, safe-area inset, and edge alignment
+- Typography metrics: font family, size, weight, line height, letter spacing, text box position, wrapping, and truncation
+- Icon and image size, crop, placement, stroke/fill style, and color
+- Screen edges and safe areas, which are easy to miss
 
-Each skill uses the standard `skills/<name>/SKILL.md` layout supported by the `skills` installer.
+It intentionally avoids noisy or low-value comparisons:
 
-## Install and Update
+- Copy-only text differences
+- Live-data differences such as timestamps, counters, labels, names, IDs, or fetched values
+- Device/system UI chrome such as phone status bars, tablet menu bars, browser chrome, home indicators, gesture bars, navigation bars, notches, and Dynamic Island
 
-Most users should install globally so the skill is available in every project.
+Those differences are reported only when they affect app-owned UI layout, component size, visual state, or typography metrics.
 
-**Codex**
+## Install
 
-```bash
-npx skills add jimmyrogue/compare-ui-to-design -a codex -g -y
-```
+Install with the standard `skills` installer. Pick the adapter for your agent:
 
-Invoke it in Codex:
+| Agent | Command |
+| :--- | :--- |
+| Codex | `npx skills add jimmyrogue/compare-ui-to-design -a codex -g -y` |
+| Claude Code | `npx skills add jimmyrogue/compare-ui-to-design -a claude-code -g -y` |
+| Antigravity | `npx skills add jimmyrogue/compare-ui-to-design -a antigravity -g -y` |
+| OpenCode | `npx skills add jimmyrogue/compare-ui-to-design -a opencode -g -y` |
 
-```text
-Use $compare-ui-to-design to compare my running UI screenshot with the Figma export and mark the UI/UX differences.
-Focus on module layout, screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients. Ignore copy-only, live-data, and device/system UI differences unless they affect app-owned UI layout.
-```
-
-**Claude Code**
-
-```bash
-npx skills add jimmyrogue/compare-ui-to-design -a claude-code -g -y
-```
-
-Invoke it as the installed skill command in Claude Code, or ask Claude to use `compare-ui-to-design`.
-
-**Other compatible agents**
-
-```bash
-npx skills add jimmyrogue/compare-ui-to-design -a antigravity -g -y
-npx skills add jimmyrogue/compare-ui-to-design -a opencode -g -y
-```
-
-**Inspect before installing**
+Inspect available skills before installing:
 
 ```bash
 npx skills add jimmyrogue/compare-ui-to-design --list
 ```
 
-**Update**
+Update installed skills:
 
 ```bash
 npx skills update -g -y
 ```
 
+## Usage Prompt
+
+```text
+Use $compare-ui-to-design to compare my running UI screenshot with the Figma export and mark the UI/UX differences.
+Focus on module layout, screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients.
+Ignore copy-only, live-data, and device/system UI differences unless they affect app-owned UI layout.
+```
+
+## Skill
+
+| Skill | When | What it does |
+| :--- | :--- | :--- |
+| [`compare-ui-to-design`](skills/compare-ui-to-design/SKILL.md) | Running UI does not visually match a Figma/design reference | Captures or accepts screenshots, runs visual diff tooling when useful, marks UI/UX difference regions, and reports precise coordinates. |
+
+This repository uses the standard `skills/<name>/SKILL.md` layout supported by the `skills` installer.
+
 ## Manual Install
 
-For agents that load skills from a local folder, copy or symlink `skills/compare-ui-to-design` into that agent's skill root. For Codex, the local skill root is usually `~/.codex/skills`:
+For agents that load skills from a local folder, copy or symlink `skills/compare-ui-to-design` into that agent's skill root:
 
 ```bash
-mkdir -p ~/.codex/skills
-ln -s "$(pwd)/skills/compare-ui-to-design" ~/.codex/skills/compare-ui-to-design
+mkdir -p /path/to/agent/skills
+ln -s "$(pwd)/skills/compare-ui-to-design" /path/to/agent/skills/compare-ui-to-design
 ```
 
 ## Visual Diff CLI
@@ -89,7 +93,7 @@ Outputs:
 - `report/diff_heatmap.png`
 - `report/regions.json`
 
-`regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, and a UI/UX category hint. Treat those hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
+`regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `audit_focus`, `ignored_by_default`, and a UI/UX category hint. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
 
 ## Project Layout
 
@@ -133,8 +137,158 @@ make skills-list
 If you have the official `skill-creator` validator locally, you can also run:
 
 ```bash
-.venv/bin/python /Users/jimmy/.codex/skills/.system/skill-creator/scripts/quick_validate.py \
-  skills/compare-ui-to-design
+python3 path/to/skill-creator/scripts/quick_validate.py skills/compare-ui-to-design
+```
+
+## License
+
+MIT
+
+---
+
+## 中文
+
+`compare-ui-to-design` 是一个面向各类 AI agent 的 skill，用于对比“实际运行中的 UI”和“设计稿/Figma 导出图”，找出 UI/UX 实现差异，并在截图上标注具体区域。
+
+它默认只做审计，不会修改业务代码；只有你明确要求修复时，agent 才应该继续改代码。
+
+## 它关注什么
+
+这个 skill 关注 UI/UX 实现是否和设计稿一致：
+
+- 模块的位置、尺寸、对齐、裁切、层级
+- 边框、圆角、阴影、分割线、背景、颜色、透明度、渐变方向
+- 间距、margin、padding、gap、安全区 inset、屏幕边缘对齐
+- 文字的字体、字号、字重、行高、字距、文本框位置、换行、截断
+- 图标和图片的尺寸、裁切、位置、描边/填充样式、颜色
+- 屏幕边缘和安全区，这些位置最容易被忽略
+
+它默认忽略低价值或容易误报的差异：
+
+- 纯文案差异
+- 动态数据差异，例如时间、计数器、标签、用户名、ID、接口返回值
+- 设备或系统自带 UI，例如手机 status bar、平板 menu bar、浏览器工具栏、home indicator、手势条、系统导航栏、刘海、Dynamic Island
+
+只有当这些差异影响了 app 自己的布局、组件尺寸、视觉状态或文字排版度量时，才应该报告。
+
+## 安装
+
+使用标准 `skills` installer 安装。根据你的 agent 选择 adapter：
+
+| Agent | 命令 |
+| :--- | :--- |
+| Codex | `npx skills add jimmyrogue/compare-ui-to-design -a codex -g -y` |
+| Claude Code | `npx skills add jimmyrogue/compare-ui-to-design -a claude-code -g -y` |
+| Antigravity | `npx skills add jimmyrogue/compare-ui-to-design -a antigravity -g -y` |
+| OpenCode | `npx skills add jimmyrogue/compare-ui-to-design -a opencode -g -y` |
+
+安装前查看仓库里的 skill：
+
+```bash
+npx skills add jimmyrogue/compare-ui-to-design --list
+```
+
+更新已安装的 skills：
+
+```bash
+npx skills update -g -y
+```
+
+## 使用提示词
+
+```text
+Use $compare-ui-to-design to compare my running UI screenshot with the Figma export and mark the UI/UX differences.
+Focus on module layout, screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients.
+Ignore copy-only, live-data, and device/system UI differences unless they affect app-owned UI layout.
+```
+
+也可以用中文直接说：
+
+```text
+使用 $compare-ui-to-design 对比实际运行截图和 Figma 设计稿，标注 UI/UX 差异。
+重点关注模块布局、屏幕边缘、安全区、间距、颜色、字体字号、图标、图片和渐变。
+忽略纯文案、动态数据、设备或系统自带 UI 的差异，除非它们影响 app 自己的布局。
+```
+
+## Skill
+
+| Skill | 使用场景 | 作用 |
+| :--- | :--- | :--- |
+| [`compare-ui-to-design`](skills/compare-ui-to-design/SKILL.md) | 实际运行 UI 和 Figma/设计稿视觉不一致 | 获取或接收截图，必要时运行视觉 diff 工具，标注 UI/UX 差异区域，并输出精确坐标。 |
+
+本仓库使用 `skills/<name>/SKILL.md` 标准结构，可被 `skills` installer 识别。
+
+## 手动安装
+
+如果你的 agent 支持从本地目录加载 skill，可以把 `skills/compare-ui-to-design` 复制或软链到该 agent 的 skill 根目录：
+
+```bash
+mkdir -p /path/to/agent/skills
+ln -s "$(pwd)/skills/compare-ui-to-design" /path/to/agent/skills/compare-ui-to-design
+```
+
+## Visual Diff CLI
+
+skill 内置了一个可重复运行的截图对比脚本，用于对比两张同尺寸截图：
+
+```bash
+python skills/compare-ui-to-design/scripts/visual_diff.py \
+  --actual actual.png \
+  --expected expected.png \
+  --out-dir report
+```
+
+输出：
+
+- `report/annotated_actual.png`
+- `report/diff_heatmap.png`
+- `report/regions.json`
+
+`regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`audit_focus`、`ignored_by_default` 和 UI/UX 分类提示。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
+
+## 项目结构
+
+```text
+.
+├── skills/compare-ui-to-design/   # 可安装 skill
+│   ├── SKILL.md
+│   ├── agents/openai.yaml
+│   ├── references/
+│   └── scripts/visual_diff.py
+├── scripts/check_skill.py          # 可移植的结构/frontmatter 检查脚本
+├── tests/                          # 合成截图测试
+├── package.json                    # skill package metadata
+├── pyproject.toml                  # Python 测试/运行依赖
+└── packaging.allowlist             # 发布/打包 allowlist
+```
+
+## 开发
+
+安装 Python 依赖：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install ".[dev]"
+```
+
+运行全部本地检查：
+
+```bash
+make check PYTHON=.venv/bin/python
+```
+
+常用命令：
+
+```bash
+make validate PYTHON=.venv/bin/python
+make test PYTHON=.venv/bin/python
+make skills-list
+```
+
+如果本地有官方 `skill-creator` validator，也可以运行：
+
+```bash
+python3 path/to/skill-creator/scripts/quick_validate.py skills/compare-ui-to-design
 ```
 
 ## License
