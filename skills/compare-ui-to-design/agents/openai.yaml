@@ -1,0 +1,4 @@
+interface:
+  display_name: "Compare UI to Design"
+  short_description: "Audit visual differences against design references"
+  default_prompt: "Use $compare-ui-to-design to compare my running UI screenshot with the design reference and mark the visual differences."
