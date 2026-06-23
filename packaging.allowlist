@@ -1,0 +1,11 @@
+# Allowlist for future release/package scripts.
+# Keep package contents explicit so generated artifacts and local installs do not ship.
+
+LICENSE
+README.md
+package.json
+pyproject.toml
+packaging.allowlist
+scripts/**
+skills/**
+tests/**

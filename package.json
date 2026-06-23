@@ -1,0 +1,49 @@
+{
+  "name": "@jimmyrogue/compare-ui-to-design",
+  "version": "0.1.0",
+  "description": "Skill and visual-diff helper for auditing running UI screenshots against design references.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimmyrogue/compare-ui-to-design.git"
+  },
+  "homepage": "https://github.com/jimmyrogue/compare-ui-to-design#readme",
+  "keywords": [
+    "agent-skills",
+    "ui",
+    "visual-diff",
+    "figma",
+    "design-review",
+    "codex",
+    "claude-code",
+    "opencode",
+    "antigravity",
+    "pi-package"
+  ],
+  "files": [
+    "LICENSE",
+    "README.md",
+    "package.json",
+    "pyproject.toml",
+    "packaging.allowlist",
+    "scripts",
+    "skills",
+    "tests",
+    "!**/__pycache__/**",
+    "!**/*.pyc"
+  ],
+  "scripts": {
+    "validate": "python3 scripts/check_skill.py skills/compare-ui-to-design",
+    "test": "python3 -m pytest",
+    "skills:list": "npx -y skills add . -a codex --list",
+    "check": "npm run validate && npm run test && npm run skills:list"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  }
+}
