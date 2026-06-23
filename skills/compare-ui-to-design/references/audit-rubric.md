@@ -31,7 +31,15 @@ Do not use `Content` as a primary category. If text or data differs, classify on
 
 - Coordinates are relative to the top-left corner of the actual screenshot.
 - Use `x`, `y`, `width`, and `height` for every region.
+- Compare `annotated_actual.png` and `annotated_expected.png` as a pair. Matching marker numbers and coordinates show the same screenshot location in actual and normalized design.
+- Check `regions.json.normalization` when source dimensions differ. The actual screenshot is the coordinate baseline; the design is proportionally fit without cropping, and any padding/offset is recorded there.
+- Use `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` to understand where changed pixels sit inside a broad marker. Do not turn every evidence pixel into a separate report row.
 - Prefer `reported_regions` for the main report; treat `regions` as raw diff evidence and `suppressed_regions` as child noise explained by a parent issue.
+- If a reported region has `finding_summary`, use it as the first script-backed interpretation of that region. Do not replace it with a guess that the region is noise unless there is concrete capture/setup evidence.
+- If a reported region has `review_guidance`, follow it before expanding child regions. In particular, a broad parent region that touches screen edges or explains suppressed children is a high-priority UI/UX finding, not a low-value pixel artifact.
+- If a reported region has `edge_evidence`, translate the edge margins into concrete UI observations: for example, `right=0px` means the actual app-owned region reaches the right screenshot edge and should be checked for missing side gutter, safe-area padding, or clipping against the design.
+- If a reported region has `visual_evidence.diff_pixel_bbox`, use that box to state where the precise pixel evidence is concentrated within the broader parent/module marker.
+- Use `suppressed_child_count` to explain hierarchy. A nonzero value usually means the tool found one parent/root issue that accounts for many internal diffs; report that parent first and avoid listing every child artifact.
 - Use `level` to preserve hierarchy: lower values are higher-level page/module/edge findings; higher values are detail-level findings.
 - Combine adjacent pixels into one issue when they belong to the same UI element or module.
 - Split regions when one broad diff contains separate root causes.

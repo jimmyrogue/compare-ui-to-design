@@ -86,6 +86,70 @@ def load_rgb(path: Path) -> tuple[Image.Image, np.ndarray]:
     return image, np.asarray(image, dtype=np.float32)
 
 
+def image_size_payload(size: tuple[int, int]) -> dict[str, int]:
+    return {"width": size[0], "height": size[1]}
+
+
+def resize_filter() -> int:
+    try:
+        return Image.Resampling.LANCZOS
+    except AttributeError:
+        return Image.LANCZOS
+
+
+def padding_color(image: Image.Image) -> tuple[int, int, int]:
+    width, height = image.size
+    corners = [
+        image.getpixel((0, 0)),
+        image.getpixel((width - 1, 0)),
+        image.getpixel((0, height - 1)),
+        image.getpixel((width - 1, height - 1)),
+    ]
+    return tuple(int(round(sum(pixel[index] for pixel in corners) / len(corners))) for index in range(3))
+
+
+def normalize_expected_to_actual(
+    expected: Image.Image,
+    actual_size: tuple[int, int],
+) -> tuple[Image.Image, dict[str, object]]:
+    expected_size = expected.size
+    if expected_size == actual_size:
+        return expected, {
+            "mode": "none",
+            "cropped": False,
+            "padded": False,
+            "scale": 1.0,
+            "offset": {"x": 0, "y": 0},
+            "original_expected_size": image_size_payload(expected_size),
+            "scaled_expected_content_size": image_size_payload(expected_size),
+            "normalized_expected_size": image_size_payload(actual_size),
+            "comparison_size": image_size_payload(actual_size),
+        }
+
+    actual_width, actual_height = actual_size
+    expected_width, expected_height = expected_size
+    scale = min(actual_width / expected_width, actual_height / expected_height)
+    scaled_width = max(1, round(expected_width * scale))
+    scaled_height = max(1, round(expected_height * scale))
+    offset_x = (actual_width - scaled_width) // 2
+    offset_y = (actual_height - scaled_height) // 2
+
+    resized = expected.resize((scaled_width, scaled_height), resize_filter())
+    normalized = Image.new("RGB", actual_size, padding_color(expected))
+    normalized.paste(resized, (offset_x, offset_y))
+    return normalized, {
+        "mode": "proportional-fit",
+        "cropped": False,
+        "padded": offset_x > 0 or offset_y > 0,
+        "scale": round(scale, 6),
+        "offset": {"x": offset_x, "y": offset_y},
+        "original_expected_size": image_size_payload(expected_size),
+        "scaled_expected_content_size": image_size_payload((scaled_width, scaled_height)),
+        "normalized_expected_size": image_size_payload(actual_size),
+        "comparison_size": image_size_payload(actual_size),
+    }
+
+
 def build_difference_mask(
     actual: np.ndarray,
     expected: np.ndarray,
@@ -494,6 +558,76 @@ def apply_hierarchy(raw_regions: list[Region], image_size: tuple[int, int]) -> t
     return raw_regions, reported, suppressed
 
 
+def edge_evidence(region: Region, image_size: tuple[int, int]) -> dict[str, object]:
+    image_width, image_height = image_size
+    margins = {
+        "left": region.x,
+        "top": region.y,
+        "right": image_width - region.right,
+        "bottom": image_height - region.bottom,
+    }
+    edge_threshold = max(2, round(min(image_width, image_height) * 0.02))
+    touches = [edge for edge, margin in margins.items() if margin <= edge_threshold]
+    return {
+        "margins": margins,
+        "touches": touches,
+        "edge_threshold": edge_threshold,
+    }
+
+
+def region_finding_text(
+    region: Region,
+    image_size: tuple[int, int],
+    child_count: int,
+) -> tuple[str, list[str]]:
+    image_width, image_height = image_size
+    width_ratio = region.width / max(1, image_width)
+    height_ratio = region.height / max(1, image_height)
+    evidence = edge_evidence(region, image_size)
+    touches = evidence["touches"]
+
+    reasons: list[str] = []
+    if region.level == 0:
+        reasons.append("high-level page/module finding")
+    elif region.level == 1:
+        reasons.append("top-level module finding")
+    elif region.level == 2:
+        reasons.append("nested module finding")
+    else:
+        reasons.append("detail-level finding")
+
+    if width_ratio >= 0.70 or height_ratio >= 0.55:
+        reasons.append(
+            f"large coverage ({region.width}x{region.height}, "
+            f"{width_ratio:.0%} width, {height_ratio:.0%} height)"
+        )
+    if touches:
+        margin_text = ", ".join(
+            f"{edge}={evidence['margins'][edge]}px" for edge in touches
+        )
+        reasons.append(f"touches screen edge ({margin_text})")
+    if child_count:
+        reasons.append(f"explains {child_count} suppressed child diff region(s)")
+    if region.source_region_ids and len(region.source_region_ids) > 1:
+        reasons.append(f"groups raw regions {list(region.source_region_ids)}")
+
+    guidance = [
+        "Treat this reported region as the primary UI/UX finding, not as a false positive.",
+        "Compare the actual screenshot against the design at this parent/module level before inspecting child details.",
+    ]
+    if touches:
+        guidance.append(
+            "Check screen-edge spacing, safe-area handling, and clipping around the touched edge(s)."
+        )
+    if child_count:
+        guidance.append(
+            "Do not expand suppressed child regions unless an independent child-level issue remains after the parent layout issue is addressed."
+        )
+
+    summary = f"{region.category_hint}: " + "; ".join(reasons) + "."
+    return summary, guidance
+
+
 def draw_annotations(actual: Image.Image, regions: list[Region]) -> Image.Image:
     annotated = actual.copy().convert("RGB")
     draw = ImageDraw.Draw(annotated)
@@ -521,6 +655,25 @@ def draw_annotations(actual: Image.Image, regions: list[Region]) -> Image.Image:
     return annotated
 
 
+def evidence_mask_for_regions(mask: np.ndarray, regions: list[Region]) -> np.ndarray:
+    evidence = np.zeros_like(mask, dtype=bool)
+    for region in regions:
+        evidence[region.y : region.bottom, region.x : region.right] |= mask[
+            region.y : region.bottom,
+            region.x : region.right,
+        ]
+    return evidence
+
+
+def draw_evidence_overlay(base: Image.Image, evidence_mask: np.ndarray, regions: list[Region]) -> Image.Image:
+    base_array = np.asarray(base.convert("RGB"), dtype=np.float32).copy()
+    highlight = np.array([255.0, 214.0, 0.0], dtype=np.float32)
+    alpha = 0.48
+    base_array[evidence_mask] = base_array[evidence_mask] * (1.0 - alpha) + highlight * alpha
+    overlay = Image.fromarray(np.clip(base_array, 0, 255).astype(np.uint8))
+    return draw_annotations(overlay, regions)
+
+
 def draw_heatmap(delta: np.ndarray) -> Image.Image:
     clipped = np.clip(delta, 0, 96)
     normalized = (clipped / 96.0 * 255).astype(np.uint8)
@@ -531,20 +684,70 @@ def draw_heatmap(delta: np.ndarray) -> Image.Image:
     return Image.fromarray(heatmap)
 
 
+def draw_graymap(delta: np.ndarray) -> Image.Image:
+    clipped = np.clip(delta, 0, 96)
+    normalized = (clipped / 96.0 * 255).astype(np.uint8)
+    return Image.fromarray(normalized)
+
+
+def diff_pixel_evidence(region: Region, mask: np.ndarray) -> tuple[int, dict[str, int] | None]:
+    region_mask = mask[region.y : region.bottom, region.x : region.right]
+    ys, xs = np.nonzero(region_mask)
+    if len(xs) == 0:
+        return 0, None
+
+    x1 = int(region.x + xs.min())
+    y1 = int(region.y + ys.min())
+    x2 = int(region.x + xs.max() + 1)
+    y2 = int(region.y + ys.max() + 1)
+    return int(len(xs)), {
+        "x": x1,
+        "y": y1,
+        "width": x2 - x1,
+        "height": y2 - y1,
+    }
+
+
 def save_regions(
     out_dir: Path,
     actual_path: Path,
     expected_path: Path,
     actual_size: tuple[int, int],
-    expected_size: tuple[int, int],
+    expected_original_size: tuple[int, int],
+    expected_normalized_size: tuple[int, int],
+    normalization: dict[str, object],
     threshold: float,
     min_area: int,
     merge_gap: int,
+    mask: np.ndarray,
     regions: list[Region],
     reported_regions: list[Region],
     suppressed_regions: list[Region],
 ) -> None:
+    artifacts = {
+        "annotated_actual": str(out_dir / "annotated_actual.png"),
+        "annotated_expected": str(out_dir / "annotated_expected.png"),
+        "evidence_overlay_actual": str(out_dir / "evidence_overlay_actual.png"),
+        "evidence_overlay_expected": str(out_dir / "evidence_overlay_expected.png"),
+        "diff_heatmap": str(out_dir / "diff_heatmap.png"),
+        "diff_graymap": str(out_dir / "diff_graymap.png"),
+        "regions": str(out_dir / "regions.json"),
+    }
+    child_counts: dict[int, int] = {}
+    for suppressed_region in suppressed_regions:
+        if suppressed_region.suppressed_by is not None:
+            child_counts[suppressed_region.suppressed_by] = (
+                child_counts.get(suppressed_region.suppressed_by, 0) + 1
+            )
+
     def region_payload(region: Region) -> dict[str, object]:
+        child_count = child_counts.get(region.region_id, 0)
+        finding_summary, review_guidance = region_finding_text(
+            region,
+            actual_size,
+            child_count,
+        )
+        diff_pixel_count, diff_pixel_bbox = diff_pixel_evidence(region, mask)
         return {
             "id": region.region_id,
             "report_id": region.report_id,
@@ -562,11 +765,24 @@ def save_regions(
             "suppressed_by": region.suppressed_by,
             "report_group": region.report_group,
             "source_region_ids": list(region.source_region_ids),
+            "suppressed_child_count": child_count,
+            "edge_evidence": edge_evidence(region, actual_size),
+            "finding_summary": finding_summary,
+            "review_guidance": review_guidance,
+            "visual_evidence": {
+                "same_coordinate_on_expected": True,
+                "coordinate_space": "actual_and_normalized_expected",
+                "evidence_overlay": True,
+                "uses_suppressed_children": child_count > 0,
+                "diff_pixel_count": diff_pixel_count,
+                "diff_pixel_bbox": diff_pixel_bbox,
+            },
         }
 
     payload = {
         "actual": str(actual_path),
         "expected": str(expected_path),
+        "artifacts": artifacts,
         "audit_order": "top-down",
         "audit_focus": (
             "UI/UX structure and visual fidelity: module position, size, border, "
@@ -585,8 +801,16 @@ def save_regions(
             "Report page, edge, and parent-module differences before child elements. "
             "Suppress child regions when a parent layout/spacing/background/edge issue explains them."
         ),
-        "actual_size": {"width": actual_size[0], "height": actual_size[1]},
-        "expected_size": {"width": expected_size[0], "height": expected_size[1]},
+        "normalization_policy": (
+            "The actual screenshot is the coordinate baseline. If the design image size differs, "
+            "the expected design is proportionally fit into the actual screenshot canvas without "
+            "cropping before diffing and annotation."
+        ),
+        "actual_size": image_size_payload(actual_size),
+        "expected_size": image_size_payload(expected_original_size),
+        "expected_normalized_size": image_size_payload(expected_normalized_size),
+        "comparison_size": image_size_payload(actual_size),
+        "normalization": normalization,
         "parameters": {
             "threshold": threshold,
             "min_area": min_area,
@@ -607,13 +831,12 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     actual_image, actual_array = load_rgb(actual_path)
-    expected_image, expected_array = load_rgb(expected_path)
-
-    if actual_image.size != expected_image.size:
-        raise SystemExit(
-            "actual and expected images must have the same pixel size; "
-            f"got actual={actual_image.size} expected={expected_image.size}"
-        )
+    expected_original_image, _ = load_rgb(expected_path)
+    expected_image, normalization = normalize_expected_to_actual(
+        expected_original_image,
+        actual_image.size,
+    )
+    expected_array = np.asarray(expected_image, dtype=np.float32)
 
     mask, delta = build_difference_mask(actual_array, expected_array, args.threshold)
     mask = denoise_mask(mask)
@@ -622,20 +845,32 @@ def main() -> int:
     regions = make_regions(merged, delta, args.max_regions)
     regions, reported_regions, suppressed_regions = apply_hierarchy(regions, actual_image.size)
 
+    evidence_mask = evidence_mask_for_regions(mask, reported_regions)
     annotated = draw_annotations(actual_image, reported_regions)
+    annotated_expected = draw_annotations(expected_image, reported_regions)
+    evidence_overlay_actual = draw_evidence_overlay(actual_image, evidence_mask, reported_regions)
+    evidence_overlay_expected = draw_evidence_overlay(expected_image, evidence_mask, reported_regions)
     heatmap = draw_heatmap(delta)
+    graymap = draw_graymap(delta)
 
     annotated.save(out_dir / "annotated_actual.png")
+    annotated_expected.save(out_dir / "annotated_expected.png")
+    evidence_overlay_actual.save(out_dir / "evidence_overlay_actual.png")
+    evidence_overlay_expected.save(out_dir / "evidence_overlay_expected.png")
     heatmap.save(out_dir / "diff_heatmap.png")
+    graymap.save(out_dir / "diff_graymap.png")
     save_regions(
         out_dir=out_dir,
         actual_path=actual_path,
         expected_path=expected_path,
         actual_size=actual_image.size,
-        expected_size=expected_image.size,
+        expected_original_size=expected_original_image.size,
+        expected_normalized_size=expected_image.size,
+        normalization=normalization,
         threshold=args.threshold,
         min_area=args.min_area,
         merge_gap=args.merge_gap,
+        mask=mask,
         regions=regions,
         reported_regions=reported_regions,
         suppressed_regions=suppressed_regions,
@@ -647,7 +882,11 @@ def main() -> int:
         f"{len(regions)} raw region(s) to {out_dir}"
     )
     print(f"- {out_dir / 'annotated_actual.png'}")
+    print(f"- {out_dir / 'annotated_expected.png'}")
+    print(f"- {out_dir / 'evidence_overlay_actual.png'}")
+    print(f"- {out_dir / 'evidence_overlay_expected.png'}")
     print(f"- {out_dir / 'diff_heatmap.png'}")
+    print(f"- {out_dir / 'diff_graymap.png'}")
     print(f"- {out_dir / 'regions.json'}")
     return 0
 

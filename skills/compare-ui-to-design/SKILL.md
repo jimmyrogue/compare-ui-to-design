@@ -28,7 +28,7 @@ Audit from top to bottom in the UI hierarchy. Start with page-level layout, then
    - Crop or mask browser chrome, simulator bezels, menu bars, status bars, navigation bars, home indicators, and other device/system UI only when they are not part of the design target.
    - Decide whether design frames include safe-area content before comparing top/bottom/side edges.
    - Preserve screenshots as PNG when possible.
-   - Do not resize one image unless the user confirms the intended scale or the mismatch is clearly from export size.
+   - If the actual screenshot and design export have different pixel sizes, use the actual screenshot as the coordinate baseline and let `visual_diff.py` proportionally fit the design into that canvas without cropping. Inspect `regions.json.normalization` before judging size, margin, or edge findings.
 
 3. Run automated visual diff when both comparable images are available.
    - Use `scripts/visual_diff.py`:
@@ -56,9 +56,15 @@ Audit from top to bottom in the UI hierarchy. Start with page-level layout, then
    - Treat the script as a detector, not a final judge.
    - Classify likely differences using `references/audit-rubric.md`.
    - Follow top-down order: page layout -> top-level modules -> nested modules -> element details.
+   - Inspect `annotated_actual.png` and `annotated_expected.png` together. They use the same actual/normalized-design coordinates and marker numbers, so compare the actual and design at each matching region before writing conclusions.
+   - When a marker is broad, inspect `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` to locate the precise changed pixels that support the parent/module finding.
    - Report modules, containers, images, icons, borders, backgrounds, gradients, typography metrics, spacing, margin, padding, and alignment first.
    - Audit screen-edge regions explicitly: top inset, bottom inset, left/right rails, safe-area padding, full-bleed backgrounds, clipped cards, sticky headers/footers, and edge-aligned controls.
    - Prefer `reported_regions` from `regions.json` for the user-facing report; use `suppressed_regions` only to explain raw diff noise or debug hierarchy decisions.
+   - When a reported region includes `finding_summary`, `review_guidance`, or `edge_evidence`, use those fields as script evidence in the report. Do not dismiss a broad parent/module region as a false positive merely because it groups many child pixel differences.
+   - When a reported region includes `visual_evidence.diff_pixel_bbox`, use it to describe where the fine-grained evidence sits inside the broader marker. The marker is the top-down audit finding; the evidence maps are supporting pixel evidence, not extra report items by themselves.
+   - If `edge_evidence.touches` includes an edge or `edge_evidence.margins` shows a very small margin such as `right=0px`, explicitly compare that edge against the design. State whether app-owned content is too close to the screen edge, clipped, missing safe-area padding, or using a different full-bleed background.
+   - Treat `suppressed_child_count > 0` as evidence that the parent issue explains lower-level noise. Report the parent/root issue first, then inspect suppressed children only for independent icon, image, typography, color, or border problems.
    - Ignore copy-only and data-only differences by default: different labels, counters, timestamps, IDs, names, list items, or backend values are not UI/UX issues unless they change visual layout.
    - Filter noise from anti-aliasing, compression, DPR rounding, dynamic content, cursor/caret state, animations, clocks, remote image loading, and system-owned UI chrome.
 
@@ -75,7 +81,10 @@ Use this concise structure:
 ```markdown
 ## Visual Differences
 
-Annotated screenshot: /absolute/path/to/annotated_actual.png
+Annotated actual: /absolute/path/to/annotated_actual.png
+Annotated design: /absolute/path/to/annotated_expected.png
+Evidence overlays: /absolute/path/to/evidence_overlay_actual.png, /absolute/path/to/evidence_overlay_expected.png
+Diff maps: /absolute/path/to/diff_heatmap.png, /absolute/path/to/diff_graymap.png
 
 | # | Region | Category | Difference |
 |---|---|---|---|
@@ -86,6 +95,8 @@ Annotated screenshot: /absolute/path/to/annotated_actual.png
 
 ## Notes
 - Screenshot size: 390x844.
+- Design normalization: expected image was proportionally fit into the actual screenshot canvas; no cropping was applied.
+- Script evidence for #4: edge margin top=0px; treat this parent/edge region as the primary UI/UX finding, not as a false positive.
 - Copy-only and live-data differences were ignored unless they affected layout.
 - Device/system UI chrome, dynamic clock, and caret regions were ignored.
 ```

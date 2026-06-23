@@ -59,6 +59,8 @@ Use $compare-ui-to-design to compare my running UI screenshot with the Figma exp
 Compare from page layout to top-level modules to nested modules to element details.
 Focus on module layout, screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients.
 Ignore copy-only, live-data, and device/system UI differences unless they affect app-owned UI layout.
+When the diff script reports a broad parent region, use its finding_summary, review_guidance, edge_evidence, and suppressed_child_count directly before deciding whether to inspect child regions.
+Compare annotated_actual.png and annotated_expected.png together, then use evidence_overlay_* and diff_graymap.png to locate the precise pixel evidence inside broad markers.
 ```
 
 ## Skill
@@ -80,7 +82,7 @@ ln -s "$(pwd)/skills/compare-ui-to-design" /path/to/agent/skills/compare-ui-to-d
 
 ## Visual Diff CLI
 
-The skill includes a deterministic helper script for comparing two same-sized screenshots:
+The skill includes a deterministic helper script for comparing an actual screenshot with a design reference. If the design reference has a different pixel size, it is proportionally fit into the actual screenshot canvas without cropping before comparison:
 
 ```bash
 python skills/compare-ui-to-design/scripts/visual_diff.py \
@@ -92,12 +94,20 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 Outputs:
 
 - `report/annotated_actual.png`
+- `report/annotated_expected.png`
+- `report/evidence_overlay_actual.png`
+- `report/evidence_overlay_expected.png`
 - `report/diff_heatmap.png`
+- `report/diff_graymap.png`
 - `report/regions.json`
 
 `regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `audit_focus`, `ignored_by_default`, and a UI/UX category hint. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
 
 The JSON also includes `audit_order: "top-down"`, `reported_regions`, and `suppressed_regions`. Use `reported_regions` for the main audit. `suppressed_regions` keeps raw child-level differences that were hidden because a parent layout/module issue explains them.
+
+Reported regions can include `finding_summary`, `review_guidance`, `edge_evidence`, and `suppressed_child_count`. Agents should use those fields directly as script evidence. A broad parent/module region is not a false positive just because it covers many child diffs; for example, `edge_evidence.margins.right = 0` means the actual app-owned region reaches the right screenshot edge and must be checked for missing side gutter, safe-area padding, or clipping against the design.
+
+Each run also returns paired visual evidence. `annotated_actual.png` and `annotated_expected.png` use the same marker numbers and coordinates, so agents can compare the actual and design views directly. When source sizes differ, `annotated_expected.png` is the normalized design image in the actual screenshot coordinate space; `regions.json.normalization` records the original design size, scale, offset, padding, and `cropped: false`. `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` show the finer changed-pixel evidence that supports broad parent/module findings without turning those pixels into extra report rows.
 
 ## Project Layout
 
@@ -205,6 +215,7 @@ npx skills update -g -y
 Use $compare-ui-to-design to compare my running UI screenshot with the Figma export and mark the UI/UX differences.
 Focus on module layout, screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients.
 Ignore copy-only, live-data, and device/system UI differences unless they affect app-owned UI layout.
+When the diff script reports a broad parent region, use its finding_summary, review_guidance, edge_evidence, and suppressed_child_count directly before deciding whether to inspect child regions.
 ```
 
 也可以用中文直接说：
@@ -214,6 +225,8 @@ Ignore copy-only, live-data, and device/system UI differences unless they affect
 先比较页面整体，再比较顶层模块、嵌套模块，最后比较元素细节。
 重点关注模块布局、屏幕边缘、安全区、间距、颜色、字体字号、图标、图片和渐变。
 忽略纯文案、动态数据、设备或系统自带 UI 的差异，除非它们影响 app 自己的布局。
+当 diff 脚本报告一个较大的父级区域时，先直接使用它的 finding_summary、review_guidance、edge_evidence 和 suppressed_child_count，再决定是否继续检查子区域。
+同时对照 annotated_actual.png 和 annotated_expected.png，再用 evidence_overlay_* 和 diff_graymap.png 定位大标记区域里的精细像素证据。
 ```
 
 ## Skill
@@ -235,7 +248,7 @@ ln -s "$(pwd)/skills/compare-ui-to-design" /path/to/agent/skills/compare-ui-to-d
 
 ## Visual Diff CLI
 
-skill 内置了一个可重复运行的截图对比脚本，用于对比两张同尺寸截图：
+skill 内置了一个可重复运行的截图对比脚本，用于对比实际截图和设计稿。如果设计稿像素尺寸不同，脚本会先把设计稿按比例完整 fit 到实际截图画布里，不做裁切，然后再对比：
 
 ```bash
 python skills/compare-ui-to-design/scripts/visual_diff.py \
@@ -247,12 +260,20 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 输出：
 
 - `report/annotated_actual.png`
+- `report/annotated_expected.png`
+- `report/evidence_overlay_actual.png`
+- `report/evidence_overlay_expected.png`
 - `report/diff_heatmap.png`
+- `report/diff_graymap.png`
 - `report/regions.json`
 
 `regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`audit_focus`、`ignored_by_default` 和 UI/UX 分类提示。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
 
 JSON 还会包含 `audit_order: "top-down"`、`reported_regions` 和 `suppressed_regions`。主报告应优先使用 `reported_regions`；`suppressed_regions` 保留被父级布局/模块问题解释掉的子级差异，方便调试。
+
+`reported_regions` 可能包含 `finding_summary`、`review_guidance`、`edge_evidence` 和 `suppressed_child_count`。Agent 应该把这些字段当作脚本证据直接使用。一个较大的父级/模块区域不应该因为覆盖了很多子级 diff 就被当成误报；例如 `edge_evidence.margins.right = 0` 表示实际 app 区域已经贴到截图右边缘，应该检查是否缺少右侧 gutter、安全区 padding，或者是否发生裁切。
+
+每次运行还会返回成对的视觉证据。`annotated_actual.png` 和 `annotated_expected.png` 使用相同编号和坐标，方便 agent 直接对照实际图与设计稿。当源图尺寸不一致时，`annotated_expected.png` 是已经归一化到实际截图坐标系的设计稿；`regions.json.normalization` 会记录原始设计稿尺寸、缩放比例、offset、padding，以及 `cropped: false`。`evidence_overlay_actual.png`、`evidence_overlay_expected.png`、`diff_heatmap.png` 和 `diff_graymap.png` 用来展示支撑父级/模块结论的精细像素证据，但这些像素证据本身不应该被展开成额外报告行。
 
 ## 项目结构
 

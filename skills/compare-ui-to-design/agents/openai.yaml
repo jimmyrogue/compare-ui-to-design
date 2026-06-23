@@ -1,4 +1,4 @@
 interface:
   display_name: "Compare UI to Design"
   short_description: "Audit UI/UX fidelity against design references"
-  default_prompt: "Use $compare-ui-to-design to compare my running UI screenshot with the design reference from page layout to modules to details, focusing on screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients while ignoring copy-only, data-only, and device/system UI differences."
+  default_prompt: "Use $compare-ui-to-design to compare my running UI screenshot with the design reference from page layout to modules to details, proportionally normalize differently sized design exports without cropping, inspect paired actual/design annotations and evidence maps, and use finding_summary, edge_evidence, visual_evidence, and suppressed_child_count before judging broad parent/module regions."
