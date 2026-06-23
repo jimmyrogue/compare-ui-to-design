@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare two UI screenshots and mark visual-difference regions."""
+"""Compare two UI screenshots and mark UI/UX visual-difference regions."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ class Region(NamedTuple):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare actual UI and expected design screenshots."
+        description="Compare actual UI and expected design screenshots for UI/UX fidelity."
     )
     parser.add_argument("--actual", required=True, help="Path to actual UI screenshot.")
     parser.add_argument("--expected", required=True, help="Path to expected design image.")
@@ -182,18 +182,18 @@ def category_hint(width: int, height: int, area: int, mean_delta: float) -> str:
     fill_ratio = area / max(width * height, 1)
 
     if height <= 3 and width >= 12:
-        return "divider/border/color"
+        return "border/divider position or color"
     if width <= 3 and height >= 12:
-        return "divider/border/alignment"
+        return "border/divider position or alignment"
     if fill_ratio < 0.18 and (aspect > 4 or aspect < 0.25):
-        return "text/icon edge or alignment"
+        return "typography/icon edge or alignment"
     if area >= 400 and mean_delta < 28:
-        return "color/background/shadow"
+        return "background color/shadow/gradient"
     if area >= 400:
-        return "layout/content"
+        return "module layout/size/visual state"
     if width <= 24 and height <= 24:
-        return "icon/detail"
-    return "visual difference"
+        return "typography/icon/image detail"
+    return "ui visual difference"
 
 
 def make_regions(
@@ -285,6 +285,18 @@ def save_regions(
     payload = {
         "actual": str(actual_path),
         "expected": str(expected_path),
+        "audit_focus": (
+            "UI/UX structure and visual fidelity: module position, size, border, "
+            "background, color, gradient, spacing, margin, padding, typography metrics, "
+            "icon/image size, alignment, and visual state."
+        ),
+        "ignored_by_default": [
+            "copy-only text differences",
+            "dynamic data differences",
+            "timestamps and counters",
+            "fetched labels or names",
+            "rasterization-only noise",
+        ],
         "actual_size": {"width": actual_size[0], "height": actual_size[1]},
         "expected_size": {"width": expected_size[0], "height": expected_size[1]},
         "parameters": {

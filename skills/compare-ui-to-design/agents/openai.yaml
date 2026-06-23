@@ -1,4 +1,4 @@
 interface:
   display_name: "Compare UI to Design"
-  short_description: "Audit visual differences against design references"
-  default_prompt: "Use $compare-ui-to-design to compare my running UI screenshot with the design reference and mark the visual differences."
+  short_description: "Audit UI/UX fidelity against design references"
+  default_prompt: "Use $compare-ui-to-design to compare my running UI screenshot with the design reference, focusing on layout, screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients while ignoring copy-only, data-only, and device/system UI differences."

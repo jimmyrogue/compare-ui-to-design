@@ -67,6 +67,41 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
         range(1, len(payload["regions"]) + 1)
     )
     assert all({"x", "y", "width", "height", "mean_delta", "max_delta"} <= set(region) for region in payload["regions"])
+    assert "UI/UX structure" in payload["audit_focus"]
+    assert "copy-only text differences" in payload["ignored_by_default"]
+    assert all("content" not in region["category_hint"].lower() for region in payload["regions"])
+    assert all("data" not in region["category_hint"].lower() for region in payload["regions"])
+
+
+def test_text_like_pixel_changes_are_not_classified_as_content(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, size=(140, 60))
+    actual = save_image(actual_path, size=(140, 60))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((20, 20, 100, 24), fill=(30, 30, 30))
+    expected_draw.rectangle((20, 30, 82, 34), fill=(30, 30, 30))
+    actual_draw.rectangle((22, 20, 102, 24), fill=(30, 30, 30))
+    actual_draw.rectangle((22, 30, 84, 34), fill=(30, 30, 30))
+
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--min-area", "4")
+
+    assert payload["regions"]
+    assert all("content" not in region["category_hint"].lower() for region in payload["regions"])
+    assert all("data" not in region["category_hint"].lower() for region in payload["regions"])
+    assert all(
+        any(
+            token in region["category_hint"].lower()
+            for token in ("typography", "icon", "image", "layout", "border", "ui", "visual")
+        )
+        for region in payload["regions"]
+    )
 
 
 def test_filters_isolated_noise(tmp_path):

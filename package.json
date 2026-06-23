@@ -1,7 +1,7 @@
 {
   "name": "@jimmyrogue/compare-ui-to-design",
   "version": "0.1.0",
-  "description": "Skill and visual-diff helper for auditing running UI screenshots against design references.",
+  "description": "Skill and visual-diff helper for auditing UI/UX fidelity against design references.",
   "license": "MIT",
   "repository": {
     "type": "git",

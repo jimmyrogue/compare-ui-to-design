@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "compare-ui-to-design"
 version = "0.1.0"
-description = "Codex skill and CLI for auditing visual differences between running UI screenshots and design references."
+description = "Agent skill and CLI for auditing UI/UX fidelity between running UI screenshots and design references."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
