@@ -30,6 +30,26 @@ def run_diff(tmp_path, actual, expected, *extra_args):
     return out_dir, json.loads((out_dir / "regions.json").read_text(encoding="utf-8"))
 
 
+def run_diff_process(tmp_path, actual, expected, *extra_args):
+    out_dir = tmp_path / "report"
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--actual",
+            str(actual),
+            "--expected",
+            str(expected),
+            "--out-dir",
+            str(out_dir),
+            *extra_args,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def save_image(path, color=(255, 255, 255), size=(120, 90)):
     image = Image.new("RGB", size, color)
     image.save(path)
@@ -73,6 +93,10 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
     assert (out_dir / "evidence_overlay_expected.png").exists()
     assert (out_dir / "diff_heatmap.png").exists()
     assert (out_dir / "diff_graymap.png").exists()
+    assert (out_dir / "annotated_raw_actual.png").exists()
+    assert (out_dir / "annotated_raw_expected.png").exists()
+    assert (out_dir / "annotated_depth_actual.png").exists()
+    assert (out_dir / "annotated_depth_expected.png").exists()
     assert payload["artifacts"] == {
         "annotated_actual": str(out_dir / "annotated_actual.png"),
         "annotated_expected": str(out_dir / "annotated_expected.png"),
@@ -80,6 +104,10 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
         "evidence_overlay_expected": str(out_dir / "evidence_overlay_expected.png"),
         "diff_heatmap": str(out_dir / "diff_heatmap.png"),
         "diff_graymap": str(out_dir / "diff_graymap.png"),
+        "annotated_raw_actual": str(out_dir / "annotated_raw_actual.png"),
+        "annotated_raw_expected": str(out_dir / "annotated_raw_expected.png"),
+        "annotated_depth_actual": str(out_dir / "annotated_depth_actual.png"),
+        "annotated_depth_expected": str(out_dir / "annotated_depth_expected.png"),
         "regions": str(out_dir / "regions.json"),
     }
     assert len(payload["regions"]) >= 3
@@ -94,6 +122,9 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
     assert all("content" not in region["category_hint"].lower() for region in payload["regions"])
     assert all("data" not in region["category_hint"].lower() for region in payload["regions"])
     assert all("visual_evidence" in region for region in payload["reported_regions"])
+    assert payload["parameters"]["hierarchy_depth"] is None
+    assert all("display_depth" in region for region in payload["regions"])
+    assert all(1 <= region["display_depth"] <= 9 for region in payload["regions"])
 
 
 def test_actual_and_expected_annotations_use_matching_coordinates(tmp_path):
@@ -306,3 +337,199 @@ def test_proportional_fit_pads_expected_without_cropping(tmp_path):
     assert payload["normalization"]["padded"] is True
     assert payload["normalization"]["offset"] == {"x": 0, "y": 20}
     assert payload["normalization"]["scaled_expected_content_size"] == {"width": 120, "height": 40}
+
+
+def test_rejects_invalid_hierarchy_depth(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    save_image(expected_path)
+    save_image(actual_path)
+
+    too_shallow = run_diff_process(tmp_path, actual_path, expected_path, "--hierarchy-depth", "0")
+    too_deep = run_diff_process(tmp_path, actual_path, expected_path, "--hierarchy-depth", "10")
+
+    assert too_shallow.returncode != 0
+    assert too_deep.returncode != 0
+    assert "hierarchy-depth must be between 1 and 9" in too_shallow.stderr
+    assert "hierarchy-depth must be between 1 and 9" in too_deep.stderr
+
+
+def test_hierarchy_depth_progressively_includes_deeper_regions(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(250, 250, 250), size=(180, 120))
+    actual = save_image(actual_path, color=(250, 250, 250), size=(180, 120))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((0, 0, 179, 18), fill=(232, 240, 255))
+    actual_draw.rectangle((0, 0, 179, 18), fill=(248, 248, 248))
+    expected_draw.rectangle((40, 42, 132, 86), fill=(230, 245, 235), outline=(120, 200, 150), width=2)
+    actual_draw.rectangle((40, 42, 132, 86), fill=(230, 245, 235), outline=(120, 200, 150), width=2)
+    expected_draw.rectangle((54, 54, 70, 70), fill=(20, 20, 20))
+    actual_draw.rectangle((54, 54, 70, 70), fill=(230, 245, 235))
+
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, shallow_payload = run_diff(tmp_path / "shallow", actual_path, expected_path, "--hierarchy-depth", "1")
+    _, mid_payload = run_diff(tmp_path / "mid", actual_path, expected_path, "--hierarchy-depth", "5")
+    _, deep_payload = run_diff(tmp_path / "deep", actual_path, expected_path, "--hierarchy-depth", "9")
+
+    assert shallow_payload["parameters"]["hierarchy_depth"] == 1
+    assert all(region["display_depth"] <= 1 for region in shallow_payload["reported_regions"])
+    assert len(mid_payload["reported_regions"]) > len(shallow_payload["reported_regions"])
+    assert any(region["display_depth"] == 5 for region in mid_payload["reported_regions"])
+    assert len(deep_payload["reported_regions"]) >= len(mid_payload["reported_regions"])
+    assert all(region["display_depth"] <= 9 for region in deep_payload["reported_regions"])
+
+    for key in (
+        "annotated_raw_actual",
+        "annotated_raw_expected",
+        "annotated_depth_actual",
+        "annotated_depth_expected",
+    ):
+        assert key in mid_payload["artifacts"]
+        assert Path(mid_payload["artifacts"][key]).exists()
+
+
+def test_depth_mode_keeps_detail_regions_inside_full_screen_edge_parent(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(250, 250, 250), size=(120, 80))
+    actual = save_image(actual_path, color=(250, 250, 250), size=(120, 100))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((48, 34, 64, 50), fill=(20, 20, 20))
+    expected.save(expected_path)
+
+    actual_draw.rectangle((0, 0, 119, 9), fill=(210, 230, 255))
+    actual_draw.rectangle((0, 90, 119, 99), fill=(210, 230, 255))
+    actual_draw.rectangle((48, 44, 64, 60), fill=(250, 250, 250))
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
+
+    assert len(payload["reported_regions"]) > 1
+    assert any(region["display_depth"] == 1 for region in payload["reported_regions"])
+    assert any(
+        region["display_depth"] == 5
+        and region["x"] <= 64
+        and region["x"] + region["width"] >= 48
+        and region["y"] <= 60
+        and region["y"] + region["height"] >= 44
+        for region in payload["reported_regions"]
+    )
+
+
+def test_hierarchy_depth_five_includes_sparse_icon_edge_regions(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(255, 255, 255), size=(1000, 1000))
+    expected_draw = ImageDraw.Draw(expected)
+    expected_draw.line((400, 500, 560, 500), fill=(0, 0, 0), width=2)
+    expected_draw.line((560, 500, 540, 485), fill=(0, 0, 0), width=2)
+    expected_draw.line((560, 500, 540, 515), fill=(0, 0, 0), width=2)
+    expected.save(expected_path)
+    save_image(actual_path, color=(255, 255, 255), size=(1000, 1000))
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
+
+    assert any(
+        region["display_depth"] == 5
+        and region["category_hint"] == "typography/icon edge or alignment"
+        for region in payload["reported_regions"]
+    )
+
+
+def test_hierarchy_policy_describes_depth_mode(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path)
+    actual = save_image(actual_path)
+    ImageDraw.Draw(expected).rectangle((20, 20, 60, 48), fill=(20, 20, 20))
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
+
+    assert "hierarchy-depth" in payload["hierarchy_policy"]
+    assert "do not hide eligible child detail regions" in payload["hierarchy_policy"]
+    assert "Suppress child regions" not in payload["hierarchy_policy"]
+
+
+def test_report_mode_detail_selects_depth_five(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(255, 255, 255), size=(1000, 1000))
+    expected_draw = ImageDraw.Draw(expected)
+    expected_draw.line((400, 500, 560, 500), fill=(0, 0, 0), width=2)
+    expected_draw.line((560, 500, 540, 485), fill=(0, 0, 0), width=2)
+    expected_draw.line((560, 500, 540, 515), fill=(0, 0, 0), width=2)
+    expected.save(expected_path)
+    save_image(actual_path, color=(255, 255, 255), size=(1000, 1000))
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail")
+
+    assert payload["parameters"]["report_mode"] == "detail"
+    assert payload["parameters"]["effective_hierarchy_depth"] == 5
+    assert any(region["display_depth"] == 5 for region in payload["reported_regions"])
+
+
+def test_hierarchy_depth_overrides_report_mode_preset(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(255, 255, 255), size=(1000, 1000))
+    ImageDraw.Draw(expected).rectangle((300, 300, 500, 500), fill=(20, 20, 20))
+    expected.save(expected_path)
+    save_image(actual_path, color=(255, 255, 255), size=(1000, 1000))
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--report-mode",
+        "detail",
+        "--hierarchy-depth",
+        "1",
+    )
+
+    assert payload["parameters"]["report_mode"] == "detail"
+    assert payload["parameters"]["hierarchy_depth"] == 1
+    assert payload["parameters"]["effective_hierarchy_depth"] == 1
+    assert all(region["display_depth"] <= 1 for region in payload["reported_regions"])
+
+
+def test_depth_mode_exposes_structured_region_buckets(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(250, 250, 250), size=(180, 120))
+    actual = save_image(actual_path, color=(250, 250, 250), size=(180, 120))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((0, 0, 179, 18), fill=(232, 240, 255))
+    actual_draw.rectangle((0, 0, 179, 18), fill=(248, 248, 248))
+    expected_draw.rectangle((54, 54, 70, 70), fill=(20, 20, 20))
+    actual_draw.rectangle((54, 54, 70, 70), fill=(250, 250, 250))
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail")
+
+    assert [region["id"] for region in payload["depth_regions"]] == [
+        region["id"] for region in payload["reported_regions"]
+    ]
+    assert all(region["display_depth"] <= 3 for region in payload["parent_regions"])
+    assert all(4 <= region["display_depth"] <= 8 for region in payload["detail_regions"])
+    assert [region["id"] for region in payload["raw_regions"]] == [
+        region["id"] for region in payload["regions"]
+    ]

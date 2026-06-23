@@ -95,19 +95,38 @@ Outputs:
 
 - `report/annotated_actual.png`
 - `report/annotated_expected.png`
+- `report/annotated_raw_actual.png`
+- `report/annotated_raw_expected.png`
+- `report/annotated_depth_actual.png`
+- `report/annotated_depth_expected.png`
 - `report/evidence_overlay_actual.png`
 - `report/evidence_overlay_expected.png`
 - `report/diff_heatmap.png`
 - `report/diff_graymap.png`
 - `report/regions.json`
 
-`regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `audit_focus`, `ignored_by_default`, and a UI/UX category hint. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
+`regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `display_depth`, `audit_focus`, `ignored_by_default`, and a UI/UX category hint. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
 
-The JSON also includes `audit_order: "top-down"`, `reported_regions`, and `suppressed_regions`. Use `reported_regions` for the main audit. `suppressed_regions` keeps raw child-level differences that were hidden because a parent layout/module issue explains them.
+The JSON also includes `audit_order: "top-down"`, `reported_regions`, `depth_regions`, `parent_regions`, `detail_regions`, `raw_regions`, and `suppressed_regions`. Use `reported_regions` for the main audit. In drilldown mode, `depth_regions` mirrors the selected preset/depth, `parent_regions` keeps page/module context, `detail_regions` isolates child findings, and `raw_regions` keeps every raw candidate for debugging.
+
+Use `--report-mode structure|module|detail|raw` to drill into deeper layers while keeping top-down context. The default command preserves the classic parent-first report. `--hierarchy-depth 1..9` is the advanced numeric form and overrides the preset when both are provided. A practical sequence is:
+
+```bash
+python skills/compare-ui-to-design/scripts/visual_diff.py \
+  --actual actual.png \
+  --expected expected.png \
+  --out-dir report-detail \
+  --report-mode detail
+```
+
+- `structure`: page, screen edge, safe area, global background (`depth=1`)
+- `module`: nested modules, cards, list rows (`depth=3`)
+- `detail`: icons, images, progress rings, badges (`depth=5`)
+- `raw`: all raw/debug regions (`depth=9`)
 
 Reported regions can include `finding_summary`, `review_guidance`, `edge_evidence`, and `suppressed_child_count`. Agents should use those fields directly as script evidence. A broad parent/module region is not a false positive just because it covers many child diffs; for example, `edge_evidence.margins.right = 0` means the actual app-owned region reaches the right screenshot edge and must be checked for missing side gutter, safe-area padding, or clipping against the design.
 
-Each run also returns paired visual evidence. `annotated_actual.png` and `annotated_expected.png` use the same marker numbers and coordinates, so agents can compare the actual and design views directly. When source sizes differ, `annotated_expected.png` is the normalized design image in the actual screenshot coordinate space; `regions.json.normalization` records the original design size, scale, offset, padding, and `cropped: false`. `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` show the finer changed-pixel evidence that supports broad parent/module findings without turning those pixels into extra report rows.
+Each run also returns paired visual evidence. `annotated_actual.png` and `annotated_expected.png` use the same marker numbers and coordinates, so agents can compare the actual and design views directly. `annotated_depth_*` shows the selected drilldown layer, and `annotated_raw_*` shows every raw candidate region. When source sizes differ, `annotated_expected.png` is the normalized design image in the actual screenshot coordinate space; `regions.json.normalization` records the original design size, scale, offset, padding, and `cropped: false`. `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` show the finer changed-pixel evidence that supports broad parent/module findings without turning those pixels into extra report rows.
 
 ## Project Layout
 
@@ -261,19 +280,38 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 
 - `report/annotated_actual.png`
 - `report/annotated_expected.png`
+- `report/annotated_raw_actual.png`
+- `report/annotated_raw_expected.png`
+- `report/annotated_depth_actual.png`
+- `report/annotated_depth_expected.png`
 - `report/evidence_overlay_actual.png`
 - `report/evidence_overlay_expected.png`
 - `report/diff_heatmap.png`
 - `report/diff_graymap.png`
 - `report/regions.json`
 
-`regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`audit_focus`、`ignored_by_default` 和 UI/UX 分类提示。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
+`regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`display_depth`、`audit_focus`、`ignored_by_default` 和 UI/UX 分类提示。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
 
-JSON 还会包含 `audit_order: "top-down"`、`reported_regions` 和 `suppressed_regions`。主报告应优先使用 `reported_regions`；`suppressed_regions` 保留被父级布局/模块问题解释掉的子级差异，方便调试。
+JSON 还会包含 `audit_order: "top-down"`、`reported_regions`、`depth_regions`、`parent_regions`、`detail_regions`、`raw_regions` 和 `suppressed_regions`。主报告应优先使用 `reported_regions`。在钻取模式下，`depth_regions` 对应当前 preset/depth，`parent_regions` 保留页面/模块上下文，`detail_regions` 聚焦子级细节，`raw_regions` 保留所有原始候选区域用于调试。
+
+使用 `--report-mode structure|module|detail|raw` 可以在保留 top-down 上下文的同时继续向细节层钻取。默认命令保持原来的父级优先报告。`--hierarchy-depth 1..9` 是高级数字形式；如果 preset 和数字同时传入，数字优先。常用命令：
+
+```bash
+python skills/compare-ui-to-design/scripts/visual_diff.py \
+  --actual actual.png \
+  --expected expected.png \
+  --out-dir report-detail \
+  --report-mode detail
+```
+
+- `structure`：页面、屏幕边缘、安全区、全局背景（`depth=1`）
+- `module`：嵌套模块、卡片、列表行（`depth=3`）
+- `detail`：图标、图片、进度环、徽标（`depth=5`）
+- `raw`：所有 raw/debug 区域（`depth=9`）
 
 `reported_regions` 可能包含 `finding_summary`、`review_guidance`、`edge_evidence` 和 `suppressed_child_count`。Agent 应该把这些字段当作脚本证据直接使用。一个较大的父级/模块区域不应该因为覆盖了很多子级 diff 就被当成误报；例如 `edge_evidence.margins.right = 0` 表示实际 app 区域已经贴到截图右边缘，应该检查是否缺少右侧 gutter、安全区 padding，或者是否发生裁切。
 
-每次运行还会返回成对的视觉证据。`annotated_actual.png` 和 `annotated_expected.png` 使用相同编号和坐标，方便 agent 直接对照实际图与设计稿。当源图尺寸不一致时，`annotated_expected.png` 是已经归一化到实际截图坐标系的设计稿；`regions.json.normalization` 会记录原始设计稿尺寸、缩放比例、offset、padding，以及 `cropped: false`。`evidence_overlay_actual.png`、`evidence_overlay_expected.png`、`diff_heatmap.png` 和 `diff_graymap.png` 用来展示支撑父级/模块结论的精细像素证据，但这些像素证据本身不应该被展开成额外报告行。
+每次运行还会返回成对的视觉证据。`annotated_actual.png` 和 `annotated_expected.png` 使用相同编号和坐标，方便 agent 直接对照实际图与设计稿。`annotated_depth_*` 展示当前选择的钻取层级，`annotated_raw_*` 展示所有原始候选区域。当源图尺寸不一致时，`annotated_expected.png` 是已经归一化到实际截图坐标系的设计稿；`regions.json.normalization` 会记录原始设计稿尺寸、缩放比例、offset、padding，以及 `cropped: false`。`evidence_overlay_actual.png`、`evidence_overlay_expected.png`、`diff_heatmap.png` 和 `diff_graymap.png` 用来展示支撑父级/模块结论的精细像素证据，但这些像素证据本身不应该被展开成额外报告行。
 
 ## 项目结构
 

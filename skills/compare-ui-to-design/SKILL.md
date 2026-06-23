@@ -52,15 +52,28 @@ Audit from top to bottom in the UI hierarchy. Start with page-level layout, then
      --merge-gap 6
    ```
 
+   - Use `--report-mode` when you need to drill into details without waiting for every parent-level issue to be resolved first. Presets are `structure`, `module`, `detail`, and `raw`. Use `--hierarchy-depth 1..9` only when you need finer control; it overrides the preset if both are provided.
+
+   ```bash
+   python skills/compare-ui-to-design/scripts/visual_diff.py \
+     --actual actual.png \
+     --expected expected.png \
+     --out-dir report-detail \
+     --report-mode detail
+   ```
+
+   - A good audit loop is: run the default command or `--report-mode structure` for structure, then rerun with `--report-mode module`, `detail`, or `raw` when the parent finding is understood well enough to inspect deeper UI details.
+
 4. Inspect the result manually.
    - Treat the script as a detector, not a final judge.
    - Classify likely differences using `references/audit-rubric.md`.
    - Follow top-down order: page layout -> top-level modules -> nested modules -> element details.
    - Inspect `annotated_actual.png` and `annotated_expected.png` together. They use the same actual/normalized-design coordinates and marker numbers, so compare the actual and design at each matching region before writing conclusions.
+   - In hierarchy-depth mode, inspect `annotated_depth_actual.png` and `annotated_depth_expected.png` for the selected drilldown layer, and use `annotated_raw_actual.png` / `annotated_raw_expected.png` when you need every raw candidate region.
    - When a marker is broad, inspect `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` to locate the precise changed pixels that support the parent/module finding.
    - Report modules, containers, images, icons, borders, backgrounds, gradients, typography metrics, spacing, margin, padding, and alignment first.
    - Audit screen-edge regions explicitly: top inset, bottom inset, left/right rails, safe-area padding, full-bleed backgrounds, clipped cards, sticky headers/footers, and edge-aligned controls.
-   - Prefer `reported_regions` from `regions.json` for the user-facing report; use `suppressed_regions` only to explain raw diff noise or debug hierarchy decisions.
+   - Prefer `reported_regions` from `regions.json` for the user-facing report. In drilldown mode, use `depth_regions` for the selected preset/depth, `parent_regions` for page/module context, `detail_regions` for inspectable child findings, and `raw_regions` only for debugging.
    - When a reported region includes `finding_summary`, `review_guidance`, or `edge_evidence`, use those fields as script evidence in the report. Do not dismiss a broad parent/module region as a false positive merely because it groups many child pixel differences.
    - When a reported region includes `visual_evidence.diff_pixel_bbox`, use it to describe where the fine-grained evidence sits inside the broader marker. The marker is the top-down audit finding; the evidence maps are supporting pixel evidence, not extra report items by themselves.
    - If `edge_evidence.touches` includes an edge or `edge_evidence.margins` shows a very small margin such as `right=0px`, explicitly compare that edge against the design. State whether app-owned content is too close to the screen edge, clipped, missing safe-area padding, or using a different full-bleed background.
@@ -83,6 +96,8 @@ Use this concise structure:
 
 Annotated actual: /absolute/path/to/annotated_actual.png
 Annotated design: /absolute/path/to/annotated_expected.png
+Depth annotations: /absolute/path/to/annotated_depth_actual.png, /absolute/path/to/annotated_depth_expected.png
+Raw annotations: /absolute/path/to/annotated_raw_actual.png, /absolute/path/to/annotated_raw_expected.png
 Evidence overlays: /absolute/path/to/evidence_overlay_actual.png, /absolute/path/to/evidence_overlay_expected.png
 Diff maps: /absolute/path/to/diff_heatmap.png, /absolute/path/to/diff_graymap.png
 

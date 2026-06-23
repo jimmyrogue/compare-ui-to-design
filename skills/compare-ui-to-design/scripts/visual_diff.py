@@ -15,6 +15,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
+REPORT_MODE_DEPTHS = {
+    "structure": 1,
+    "module": 3,
+    "detail": 5,
+    "raw": 9,
+}
+
+
 @dataclass
 class Region:
     region_id: int
@@ -29,6 +37,7 @@ class Region:
     level: int = 3
     parent_id: int | None = None
     priority: float = 0.0
+    display_depth: int = 9
     suppressed_by: int | None = None
     report_group: str = ""
     report_id: int | None = None
@@ -48,6 +57,12 @@ class Region:
 
 
 def parse_args() -> argparse.Namespace:
+    def hierarchy_depth(value: str) -> int:
+        depth = int(value)
+        if depth < 1 or depth > 9:
+            raise argparse.ArgumentTypeError("hierarchy-depth must be between 1 and 9")
+        return depth
+
     parser = argparse.ArgumentParser(
         description="Compare actual UI and expected design screenshots for UI/UX fidelity."
     )
@@ -77,6 +92,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=80,
         help="Maximum regions to include before truncating smallest regions. Default: 80.",
+    )
+    parser.add_argument(
+        "--hierarchy-depth",
+        type=hierarchy_depth,
+        default=None,
+        help=(
+            "Maximum public hierarchy depth to report, from 1 (page/edge) to "
+            "9 (all raw/debug regions). Default preserves top-down compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--report-mode",
+        choices=tuple(REPORT_MODE_DEPTHS),
+        default=None,
+        help=(
+            "Named hierarchy preset: structure=1, module=3, detail=5, raw=9. "
+            "--hierarchy-depth overrides this preset when both are provided."
+        ),
     )
     return parser.parse_args()
 
@@ -272,6 +305,8 @@ def category_hint(width: int, height: int, area: int, mean_delta: float) -> str:
         return "border/divider position or alignment"
     if fill_ratio < 0.18 and (aspect > 4 or aspect < 0.25):
         return "typography/icon edge or alignment"
+    if width <= 96 and height <= 96 and area <= 6000:
+        return "typography/icon/image detail"
     if area >= 400 and mean_delta < 28:
         return "background color/shadow/gradient"
     if area >= 400:
@@ -400,6 +435,37 @@ def classify_hierarchy_level(region: Region, image_size: tuple[int, int]) -> tup
     return level, round(priority, 2), hint
 
 
+def display_depth_for_region(region: Region, image_size: tuple[int, int]) -> int:
+    image_width, image_height = image_size
+    min_dimension = max(1, min(image_width, image_height))
+    max_dimension = max(region.width, region.height)
+    bbox_ratio = region.bbox_area / max(1, image_width * image_height)
+    hint = region.category_hint.lower()
+    edge = touches_screen_edge(region, image_size)
+
+    if region.level == 0 or (edge and bbox_ratio >= 0.01):
+        return 1
+    if region.level == 1:
+        return 2
+    if "border" in hint or "divider" in hint or "shadow" in hint:
+        return 7
+    if "typography/icon edge" in hint:
+        return 5
+    if "typography/icon/image detail" in hint:
+        return 5
+    if "background" in hint or "gradient" in hint:
+        return 7 if region.level >= 2 else 2
+    if region.level == 2:
+        return 3
+    if max_dimension <= max(24, round(min_dimension * 0.06)):
+        return 5
+    if max_dimension <= max(48, round(min_dimension * 0.10)):
+        return 6
+    if max_dimension <= max(72, round(min_dimension * 0.14)):
+        return 8
+    return 9
+
+
 def should_link_for_group(a: Region, b: Region, image_size: tuple[int, int]) -> bool:
     image_width, image_height = image_size
     max_gap_x = max(12, round(image_width * 0.35))
@@ -486,6 +552,7 @@ def grouped_regions(raw_regions: list[Region], image_size: tuple[int, int]) -> l
             candidate,
             image_size,
         )
+        candidate.display_depth = display_depth_for_region(candidate, image_size)
         if candidate.level <= 2:
             synthetic.append(candidate)
             next_id += 1
@@ -505,12 +572,43 @@ def is_parent_level(region: Region) -> bool:
     )
 
 
-def apply_hierarchy(raw_regions: list[Region], image_size: tuple[int, int]) -> tuple[list[Region], list[Region], list[Region]]:
+def reset_reporting(regions: Iterable[Region]) -> None:
+    for region in regions:
+        region.parent_id = None
+        region.suppressed_by = None
+        region.report_id = None
+
+
+def assign_parent_links(
+    raw_regions: list[Region],
+    parent_candidates: list[Region],
+) -> None:
+    for region in raw_regions:
+        for parent in parent_candidates:
+            if parent.region_id == region.region_id:
+                continue
+            if parent.level >= region.level:
+                continue
+            if not contains_region(parent, region, padding=4):
+                continue
+            if is_parent_level(parent):
+                region.parent_id = parent.region_id
+                region.report_group = parent.report_group or f"region-{parent.region_id}"
+                break
+
+
+def apply_hierarchy(
+    raw_regions: list[Region],
+    image_size: tuple[int, int],
+    hierarchy_depth: int | None = None,
+) -> tuple[list[Region], list[Region], list[Region]]:
+    reset_reporting(raw_regions)
     for region in raw_regions:
         region.level, region.priority, region.category_hint = classify_hierarchy_level(
             region,
             image_size,
         )
+        region.display_depth = display_depth_for_region(region, image_size)
         region.report_group = f"region-{region.region_id}"
 
     synthetic_groups = grouped_regions(raw_regions, image_size)
@@ -518,6 +616,28 @@ def apply_hierarchy(raw_regions: list[Region], image_size: tuple[int, int]) -> t
         [*synthetic_groups, *[region for region in raw_regions if is_parent_level(region)]],
         key=lambda region: (region.level, -region.priority, region.y, region.x),
     )
+
+    if hierarchy_depth is not None:
+        reset_reporting([*raw_regions, *synthetic_groups])
+        assign_parent_links(raw_regions, parent_candidates)
+        candidates = [*synthetic_groups, *raw_regions]
+        reported = [
+            region
+            for region in candidates
+            if region.display_depth <= hierarchy_depth
+        ]
+        reported.sort(
+            key=lambda region: (
+                region.display_depth,
+                region.level,
+                -region.priority,
+                region.y,
+                region.x,
+            )
+        )
+        for report_id, region in enumerate(reported, start=1):
+            region.report_id = report_id
+        return raw_regions, reported, []
 
     reported: list[Region] = []
     for group in synthetic_groups:
@@ -708,6 +828,34 @@ def diff_pixel_evidence(region: Region, mask: np.ndarray) -> tuple[int, dict[str
     }
 
 
+def hierarchy_policy_text(
+    hierarchy_depth: int | None,
+    report_mode: str | None,
+    effective_depth: int | None,
+) -> str:
+    if effective_depth is None:
+        return (
+            "Report page, edge, and parent-module differences before child elements. "
+            "Suppress child regions when a parent layout/spacing/background/edge issue explains them."
+        )
+    source = f"report-mode {report_mode!r}" if hierarchy_depth is None and report_mode else "hierarchy-depth"
+    return (
+        f"Report regions up to hierarchy-depth {effective_depth} from {source} in top-down order. "
+        "Parent regions stay visible for context but do not hide eligible child detail regions."
+    )
+
+
+def effective_hierarchy_depth(
+    hierarchy_depth: int | None,
+    report_mode: str | None,
+) -> int | None:
+    if hierarchy_depth is not None:
+        return hierarchy_depth
+    if report_mode is not None:
+        return REPORT_MODE_DEPTHS[report_mode]
+    return None
+
+
 def save_regions(
     out_dir: Path,
     actual_path: Path,
@@ -719,6 +867,9 @@ def save_regions(
     threshold: float,
     min_area: int,
     merge_gap: int,
+    hierarchy_depth: int | None,
+    report_mode: str | None,
+    effective_depth: int | None,
     mask: np.ndarray,
     regions: list[Region],
     reported_regions: list[Region],
@@ -731,6 +882,10 @@ def save_regions(
         "evidence_overlay_expected": str(out_dir / "evidence_overlay_expected.png"),
         "diff_heatmap": str(out_dir / "diff_heatmap.png"),
         "diff_graymap": str(out_dir / "diff_graymap.png"),
+        "annotated_raw_actual": str(out_dir / "annotated_raw_actual.png"),
+        "annotated_raw_expected": str(out_dir / "annotated_raw_expected.png"),
+        "annotated_depth_actual": str(out_dir / "annotated_depth_actual.png"),
+        "annotated_depth_expected": str(out_dir / "annotated_depth_expected.png"),
         "regions": str(out_dir / "regions.json"),
     }
     child_counts: dict[int, int] = {}
@@ -760,6 +915,7 @@ def save_regions(
             "max_delta": region.max_delta,
             "category_hint": region.category_hint,
             "level": region.level,
+            "display_depth": region.display_depth,
             "parent_id": region.parent_id,
             "priority": region.priority,
             "suppressed_by": region.suppressed_by,
@@ -797,10 +953,7 @@ def save_regions(
             "device/system UI chrome",
             "rasterization-only noise",
         ],
-        "hierarchy_policy": (
-            "Report page, edge, and parent-module differences before child elements. "
-            "Suppress child regions when a parent layout/spacing/background/edge issue explains them."
-        ),
+        "hierarchy_policy": hierarchy_policy_text(hierarchy_depth, report_mode, effective_depth),
         "normalization_policy": (
             "The actual screenshot is the coordinate baseline. If the design image size differs, "
             "the expected design is proportionally fit into the actual screenshot canvas without "
@@ -815,16 +968,36 @@ def save_regions(
             "threshold": threshold,
             "min_area": min_area,
             "merge_gap": merge_gap,
+            "hierarchy_depth": hierarchy_depth,
+            "report_mode": report_mode,
+            "effective_hierarchy_depth": effective_depth,
         },
         "regions": [region_payload(region) for region in regions],
         "reported_regions": [region_payload(region) for region in reported_regions],
         "suppressed_regions": [region_payload(region) for region in suppressed_regions],
+        "depth_regions": [
+            region_payload(region)
+            for region in reported_regions
+            if effective_depth is not None
+        ],
+        "parent_regions": [
+            region_payload(region)
+            for region in reported_regions
+            if region.display_depth <= 3
+        ],
+        "detail_regions": [
+            region_payload(region)
+            for region in reported_regions
+            if 4 <= region.display_depth <= 8
+        ],
+        "raw_regions": [region_payload(region) for region in regions],
     }
     (out_dir / "regions.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def main() -> int:
     args = parse_args()
+    effective_depth = effective_hierarchy_depth(args.hierarchy_depth, args.report_mode)
     actual_path = Path(args.actual).expanduser().resolve()
     expected_path = Path(args.expected).expanduser().resolve()
     out_dir = Path(args.out_dir).expanduser().resolve()
@@ -843,11 +1016,19 @@ def main() -> int:
     components = connected_components(mask, args.min_area)
     merged = merge_components(components, args.merge_gap)
     regions = make_regions(merged, delta, args.max_regions)
-    regions, reported_regions, suppressed_regions = apply_hierarchy(regions, actual_image.size)
+    regions, reported_regions, suppressed_regions = apply_hierarchy(
+        regions,
+        actual_image.size,
+        effective_depth,
+    )
 
     evidence_mask = evidence_mask_for_regions(mask, reported_regions)
     annotated = draw_annotations(actual_image, reported_regions)
     annotated_expected = draw_annotations(expected_image, reported_regions)
+    annotated_raw = draw_annotations(actual_image, regions)
+    annotated_raw_expected = draw_annotations(expected_image, regions)
+    annotated_depth = draw_annotations(actual_image, reported_regions)
+    annotated_depth_expected = draw_annotations(expected_image, reported_regions)
     evidence_overlay_actual = draw_evidence_overlay(actual_image, evidence_mask, reported_regions)
     evidence_overlay_expected = draw_evidence_overlay(expected_image, evidence_mask, reported_regions)
     heatmap = draw_heatmap(delta)
@@ -855,6 +1036,10 @@ def main() -> int:
 
     annotated.save(out_dir / "annotated_actual.png")
     annotated_expected.save(out_dir / "annotated_expected.png")
+    annotated_raw.save(out_dir / "annotated_raw_actual.png")
+    annotated_raw_expected.save(out_dir / "annotated_raw_expected.png")
+    annotated_depth.save(out_dir / "annotated_depth_actual.png")
+    annotated_depth_expected.save(out_dir / "annotated_depth_expected.png")
     evidence_overlay_actual.save(out_dir / "evidence_overlay_actual.png")
     evidence_overlay_expected.save(out_dir / "evidence_overlay_expected.png")
     heatmap.save(out_dir / "diff_heatmap.png")
@@ -870,6 +1055,9 @@ def main() -> int:
         threshold=args.threshold,
         min_area=args.min_area,
         merge_gap=args.merge_gap,
+        hierarchy_depth=args.hierarchy_depth,
+        report_mode=args.report_mode,
+        effective_depth=effective_depth,
         mask=mask,
         regions=regions,
         reported_regions=reported_regions,
@@ -883,6 +1071,10 @@ def main() -> int:
     )
     print(f"- {out_dir / 'annotated_actual.png'}")
     print(f"- {out_dir / 'annotated_expected.png'}")
+    print(f"- {out_dir / 'annotated_raw_actual.png'}")
+    print(f"- {out_dir / 'annotated_raw_expected.png'}")
+    print(f"- {out_dir / 'annotated_depth_actual.png'}")
+    print(f"- {out_dir / 'annotated_depth_expected.png'}")
     print(f"- {out_dir / 'evidence_overlay_actual.png'}")
     print(f"- {out_dir / 'evidence_overlay_expected.png'}")
     print(f"- {out_dir / 'diff_heatmap.png'}")
