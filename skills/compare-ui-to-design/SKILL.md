@@ -1,6 +1,6 @@
 ---
 name: compare-ui-to-design
-description: Audit UI/UX visual fidelity between a running UI and a design reference. Use when an AI agent needs to compare web pages, app screenshots, iOS/Android simulators, real-device screenshots, Figma exports, design mockups, or image/PDF references for module position, size, border, color, background, gradient, spacing, margin, padding, typography metrics, icon/image size, alignment, screen-edge, and safe-area differences; mark differences on screenshots and report precise coordinates while ignoring copy/data-only and device/system UI mismatches unless they affect app-owned layout.
+description: Audit UI/UX visual fidelity between a running UI and a design reference in top-down hierarchy order. Use when an AI agent needs to compare web pages, app screenshots, iOS/Android simulators, real-device screenshots, Figma exports, design mockups, or image/PDF references for page layout, module position, size, border, color, background, gradient, spacing, margin, padding, typography metrics, icon/image size, alignment, screen-edge, and safe-area differences; mark differences on screenshots and report precise coordinates while ignoring copy/data-only and device/system UI mismatches unless they affect app-owned layout.
 ---
 
 # Compare UI to Design
@@ -12,6 +12,8 @@ Use this skill to compare an actual running UI against a design reference and pr
 Focus on UI/UX implementation fidelity, not copy review or dynamic data parity. Treat text values, timestamps, counters, list content, and fetched data as ignorable context unless they change layout, wrapping, size, typography, alignment, or visual state.
 
 Pay special attention to screen edges and safe-area boundaries. Top, bottom, left, and right edge spacing is easy to miss, especially around status bars, menu bars, navigation bars, home indicators, browser chrome, notches, and tablet split-view gutters. Compare those regions only when they belong to the designed UI; otherwise ignore device/system UI differences.
+
+Audit from top to bottom in the UI hierarchy. Start with page-level layout, then top-level modules, then nested modules, then element details. If a parent module or page-level spacing issue explains child differences, report the parent issue first and do not expand every child pixel difference unless the child has an independent UI problem.
 
 ## Workflow
 
@@ -53,8 +55,10 @@ Pay special attention to screen edges and safe-area boundaries. Top, bottom, lef
 4. Inspect the result manually.
    - Treat the script as a detector, not a final judge.
    - Classify likely differences using `references/audit-rubric.md`.
+   - Follow top-down order: page layout -> top-level modules -> nested modules -> element details.
    - Report modules, containers, images, icons, borders, backgrounds, gradients, typography metrics, spacing, margin, padding, and alignment first.
    - Audit screen-edge regions explicitly: top inset, bottom inset, left/right rails, safe-area padding, full-bleed backgrounds, clipped cards, sticky headers/footers, and edge-aligned controls.
+   - Prefer `reported_regions` from `regions.json` for the user-facing report; use `suppressed_regions` only to explain raw diff noise or debug hierarchy decisions.
    - Ignore copy-only and data-only differences by default: different labels, counters, timestamps, IDs, names, list items, or backend values are not UI/UX issues unless they change visual layout.
    - Filter noise from anti-aliasing, compression, DPR rounding, dynamic content, cursor/caret state, animations, clocks, remote image loading, and system-owned UI chrome.
 
@@ -92,4 +96,4 @@ Keep the report factual. Avoid vague language like "looks different" unless foll
 
 - `scripts/visual_diff.py`: deterministic image comparison and annotation CLI.
 - `references/capture-checklist.md`: capture rules for Web, Figma, simulators, and devices.
-- `references/audit-rubric.md`: difference categories, tolerance policy, and reporting rules.
+- `references/audit-rubric.md`: top-down hierarchy, difference categories, tolerance policy, and reporting rules.

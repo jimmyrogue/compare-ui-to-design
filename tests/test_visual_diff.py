@@ -104,6 +104,86 @@ def test_text_like_pixel_changes_are_not_classified_as_content(tmp_path):
     )
 
 
+def test_parent_module_shift_suppresses_child_regions(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, size=(220, 160))
+    actual = save_image(actual_path, size=(220, 160))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((40, 30, 160, 110), outline=(30, 80, 180), width=3)
+    actual_draw.rectangle((48, 30, 168, 110), outline=(30, 80, 180), width=3)
+    expected_draw.rectangle((60, 52, 92, 66), fill=(30, 30, 30))
+    actual_draw.rectangle((68, 52, 100, 66), fill=(30, 30, 30))
+    expected_draw.rectangle((60, 78, 132, 90), fill=(210, 220, 240))
+    actual_draw.rectangle((68, 78, 140, 90), fill=(210, 220, 240))
+
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--min-area", "4")
+
+    assert payload["audit_order"] == "top-down"
+    assert payload["reported_regions"]
+    assert payload["suppressed_regions"]
+    assert len(payload["reported_regions"]) < len(payload["regions"])
+    assert payload["reported_regions"][0]["level"] <= 2
+    assert len(payload["reported_regions"][0]["source_region_ids"]) > 1
+    assert all(region["suppressed_by"] is not None for region in payload["suppressed_regions"])
+
+
+def test_edge_safe_area_difference_is_reported_first(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, size=(160, 120), color=(250, 250, 250))
+    actual = save_image(actual_path, size=(160, 120), color=(250, 250, 250))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((0, 0, 159, 18), fill=(232, 240, 255))
+    actual_draw.rectangle((0, 0, 159, 18), fill=(248, 248, 248))
+    expected_draw.rectangle((90, 70, 104, 84), fill=(20, 20, 20))
+    actual_draw.rectangle((90, 70, 104, 84), fill=(255, 255, 255))
+
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path)
+
+    first = payload["reported_regions"][0]
+    assert first["level"] == 0
+    assert first["y"] == 0
+    assert "edge" in first["category_hint"].lower() or "safe-area" in first["category_hint"].lower()
+
+
+def test_child_difference_is_reported_when_parent_matches(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, size=(180, 120))
+    actual = save_image(actual_path, size=(180, 120))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((24, 24, 156, 96), fill=(238, 242, 248))
+    actual_draw.rectangle((24, 24, 156, 96), fill=(238, 242, 248))
+    expected_draw.rectangle((44, 44, 62, 62), fill=(20, 20, 20))
+    actual_draw.rectangle((44, 44, 62, 62), fill=(238, 242, 248))
+
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path)
+
+    assert len(payload["reported_regions"]) == 1
+    assert payload["suppressed_regions"] == []
+    assert payload["reported_regions"][0]["level"] >= 2
+    assert "content" not in payload["reported_regions"][0]["category_hint"].lower()
+
+
 def test_filters_isolated_noise(tmp_path):
     expected_path = tmp_path / "expected.png"
     actual_path = tmp_path / "actual.png"

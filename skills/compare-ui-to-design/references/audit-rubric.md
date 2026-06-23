@@ -4,6 +4,8 @@ Use this reference to classify UI/UX implementation differences and decide what 
 
 ## Default Sensitivity
 
+- Compare in hierarchy order: page-level layout first, then top-level modules, nested modules, and finally element details.
+- Return parent/module problems before child details. If a parent layout, spacing, background, or edge issue explains child differences, do not expand every child region in the main report.
 - Report subtle but meaningful UI/UX differences: module position and size, color shifts, 1-2 px spacing changes, margin/padding drift, misalignment, font size/weight/line-height changes, missing or wrong icons, image crop/size changes, radius changes, shadow/elevation differences, border changes, and gradient color/direction differences.
 - Always check screen edges and safe-area boundaries as a separate pass: top, bottom, left, right, status-bar-adjacent areas, menu-bar-adjacent areas, home-indicator-adjacent areas, full-bleed backgrounds, and edge-aligned controls.
 - Filter isolated noise from anti-aliasing, compression, subpixel rendering, DPR rounding, text rasterization, and transparent edge pixels.
@@ -29,6 +31,8 @@ Do not use `Content` as a primary category. If text or data differs, classify on
 
 - Coordinates are relative to the top-left corner of the actual screenshot.
 - Use `x`, `y`, `width`, and `height` for every region.
+- Prefer `reported_regions` for the main report; treat `regions` as raw diff evidence and `suppressed_regions` as child noise explained by a parent issue.
+- Use `level` to preserve hierarchy: lower values are higher-level page/module/edge findings; higher values are detail-level findings.
 - Combine adjacent pixels into one issue when they belong to the same UI element or module.
 - Split regions when one broad diff contains separate root causes.
 - Prefer a clear module/element-level region over a huge page-level rectangle.

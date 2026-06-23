@@ -13,6 +13,7 @@ English | [中文](#中文)
 
 The skill focuses on:
 
+- Top-down comparison: page layout, top-level modules, nested modules, then element details
 - Module position, size, alignment, clipping, and z-order
 - Border, radius, shadow, divider, background, color, opacity, and gradient direction
 - Spacing, margin, padding, gap, safe-area inset, and edge alignment
@@ -55,6 +56,7 @@ npx skills update -g -y
 
 ```text
 Use $compare-ui-to-design to compare my running UI screenshot with the Figma export and mark the UI/UX differences.
+Compare from page layout to top-level modules to nested modules to element details.
 Focus on module layout, screen edges, safe areas, spacing, color, typography metrics, icons, images, and gradients.
 Ignore copy-only, live-data, and device/system UI differences unless they affect app-owned UI layout.
 ```
@@ -94,6 +96,8 @@ Outputs:
 - `report/regions.json`
 
 `regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `audit_focus`, `ignored_by_default`, and a UI/UX category hint. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
+
+The JSON also includes `audit_order: "top-down"`, `reported_regions`, and `suppressed_regions`. Use `reported_regions` for the main audit. `suppressed_regions` keeps raw child-level differences that were hidden because a parent layout/module issue explains them.
 
 ## Project Layout
 
@@ -156,6 +160,7 @@ MIT
 
 这个 skill 关注 UI/UX 实现是否和设计稿一致：
 
+- 按层级从整体到局部对比：页面整体、顶层模块、嵌套模块、元素细节
 - 模块的位置、尺寸、对齐、裁切、层级
 - 边框、圆角、阴影、分割线、背景、颜色、透明度、渐变方向
 - 间距、margin、padding、gap、安全区 inset、屏幕边缘对齐
@@ -206,6 +211,7 @@ Ignore copy-only, live-data, and device/system UI differences unless they affect
 
 ```text
 使用 $compare-ui-to-design 对比实际运行截图和 Figma 设计稿，标注 UI/UX 差异。
+先比较页面整体，再比较顶层模块、嵌套模块，最后比较元素细节。
 重点关注模块布局、屏幕边缘、安全区、间距、颜色、字体字号、图标、图片和渐变。
 忽略纯文案、动态数据、设备或系统自带 UI 的差异，除非它们影响 app 自己的布局。
 ```
@@ -245,6 +251,8 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 - `report/regions.json`
 
 `regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`audit_focus`、`ignored_by_default` 和 UI/UX 分类提示。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
+
+JSON 还会包含 `audit_order: "top-down"`、`reported_regions` 和 `suppressed_regions`。主报告应优先使用 `reported_regions`；`suppressed_regions` 保留被父级布局/模块问题解释掉的子级差异，方便调试。
 
 ## 项目结构
 

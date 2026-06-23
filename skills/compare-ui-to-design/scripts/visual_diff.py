@@ -7,14 +7,16 @@ import argparse
 import json
 import math
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import Iterable
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 
-class Region(NamedTuple):
+@dataclass
+class Region:
     region_id: int
     x: int
     y: int
@@ -24,6 +26,25 @@ class Region(NamedTuple):
     mean_delta: float
     max_delta: float
     category_hint: str
+    level: int = 3
+    parent_id: int | None = None
+    priority: float = 0.0
+    suppressed_by: int | None = None
+    report_group: str = ""
+    report_id: int | None = None
+    source_region_ids: tuple[int, ...] = field(default_factory=tuple)
+
+    @property
+    def right(self) -> int:
+        return self.x + self.width
+
+    @property
+    def bottom(self) -> int:
+        return self.y + self.height
+
+    @property
+    def bbox_area(self) -> int:
+        return self.width * self.height
 
 
 def parse_args() -> argparse.Namespace:
@@ -228,10 +249,249 @@ def make_regions(
                 mean_delta=round(mean_delta, 2),
                 max_delta=round(max_delta, 2),
                 category_hint=category_hint(width, height, area, mean_delta),
+                source_region_ids=(idx,),
             )
         )
 
     return regions
+
+
+def touches_screen_edge(region: Region, image_size: tuple[int, int]) -> bool:
+    image_width, image_height = image_size
+    edge_margin = max(2, round(min(image_width, image_height) * 0.015))
+    return (
+        region.x <= edge_margin
+        or region.y <= edge_margin
+        or image_width - region.right <= edge_margin
+        or image_height - region.bottom <= edge_margin
+    )
+
+
+def overlap_amount(a1: int, a2: int, b1: int, b2: int) -> int:
+    return max(0, min(a2, b2) - max(a1, b1))
+
+
+def overlap_ratio(a: Region, b: Region, axis: str) -> float:
+    if axis == "x":
+        overlap = overlap_amount(a.x, a.right, b.x, b.right)
+        return overlap / max(1, min(a.width, b.width))
+    if axis == "y":
+        overlap = overlap_amount(a.y, a.bottom, b.y, b.bottom)
+        return overlap / max(1, min(a.height, b.height))
+    raise ValueError(f"unknown axis: {axis}")
+
+
+def contains_region(parent: Region, child: Region, padding: int = 0) -> bool:
+    return (
+        parent.x - padding <= child.x
+        and parent.y - padding <= child.y
+        and parent.right + padding >= child.right
+        and parent.bottom + padding >= child.bottom
+    )
+
+
+def is_thin_vertical(region: Region) -> bool:
+    return region.height >= 12 and region.width <= max(4, round(region.height * 0.25))
+
+
+def is_thin_horizontal(region: Region) -> bool:
+    return region.width >= 12 and region.height <= max(4, round(region.width * 0.25))
+
+
+def classify_hierarchy_level(region: Region, image_size: tuple[int, int]) -> tuple[int, float, str]:
+    image_width, image_height = image_size
+    image_area = image_width * image_height
+    bbox_ratio = region.bbox_area / max(1, image_area)
+    width_ratio = region.width / max(1, image_width)
+    height_ratio = region.height / max(1, image_height)
+    edge = touches_screen_edge(region, image_size)
+    hint = region.category_hint
+
+    if edge and (width_ratio >= 0.24 or height_ratio >= 0.16 or bbox_ratio >= 0.015):
+        level = 0
+        hint = "edge/safe-area layout or background"
+    elif bbox_ratio >= 0.12 or width_ratio >= 0.72 or height_ratio >= 0.55:
+        level = 0
+    elif bbox_ratio >= 0.035 or width_ratio >= 0.34 or height_ratio >= 0.22:
+        level = 1
+    elif bbox_ratio >= 0.008 or width_ratio >= 0.14 or height_ratio >= 0.10:
+        level = 2
+    else:
+        level = 3
+
+    priority = (
+        region.bbox_area * 0.35
+        + region.area * 1.8
+        + region.mean_delta * 4.0
+        + width_ratio * 200.0
+        + height_ratio * 200.0
+    )
+    if edge:
+        priority += 1200.0
+    if "background" in hint or "layout" in hint or "safe-area" in hint:
+        priority += 400.0
+    if "typography/icon/image detail" in hint and level < 3 and bbox_ratio < 0.025:
+        level = 3
+
+    return level, round(priority, 2), hint
+
+
+def should_link_for_group(a: Region, b: Region, image_size: tuple[int, int]) -> bool:
+    image_width, image_height = image_size
+    max_gap_x = max(12, round(image_width * 0.35))
+    max_gap_y = max(12, round(image_height * 0.18))
+
+    same_y_band = overlap_ratio(a, b, "y") >= 0.72
+    same_x_band = overlap_ratio(a, b, "x") >= 0.72
+    horizontal_gap = max(0, max(a.x, b.x) - min(a.right, b.right))
+    vertical_gap = max(0, max(a.y, b.y) - min(a.bottom, b.bottom))
+
+    if same_y_band and horizontal_gap <= max_gap_x:
+        return is_thin_vertical(a) or is_thin_vertical(b) or a.height >= 18 or b.height >= 18
+    if same_x_band and vertical_gap <= max_gap_y:
+        return is_thin_horizontal(a) or is_thin_horizontal(b) or a.width >= 18 or b.width >= 18
+    return False
+
+
+def grouped_regions(raw_regions: list[Region], image_size: tuple[int, int]) -> list[Region]:
+    if len(raw_regions) < 2:
+        return []
+
+    parent = list(range(len(raw_regions)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for i, first in enumerate(raw_regions):
+        for j in range(i + 1, len(raw_regions)):
+            if should_link_for_group(first, raw_regions[j], image_size):
+                union(i, j)
+
+    groups: dict[int, list[Region]] = {}
+    for index, region in enumerate(raw_regions):
+        groups.setdefault(find(index), []).append(region)
+
+    synthetic: list[Region] = []
+    next_id = len(raw_regions) + 1
+    image_area = image_size[0] * image_size[1]
+
+    for source_regions in groups.values():
+        if len(source_regions) < 2:
+            continue
+
+        x1 = min(region.x for region in source_regions)
+        y1 = min(region.y for region in source_regions)
+        x2 = max(region.right for region in source_regions)
+        y2 = max(region.bottom for region in source_regions)
+        width = x2 - x1
+        height = y2 - y1
+        bbox_area = width * height
+        if bbox_area / max(1, image_area) < 0.012:
+            continue
+
+        area = sum(region.area for region in source_regions)
+        mean_delta = round(
+            sum(region.mean_delta * region.area for region in source_regions) / max(area, 1),
+            2,
+        )
+        max_delta = max(region.max_delta for region in source_regions)
+        source_ids = tuple(region.region_id for region in source_regions)
+        candidate = Region(
+            region_id=next_id,
+            x=x1,
+            y=y1,
+            width=width,
+            height=height,
+            area=area,
+            mean_delta=mean_delta,
+            max_delta=max_delta,
+            category_hint="module layout/spacing group",
+            report_group=f"group-{next_id}",
+            source_region_ids=source_ids,
+        )
+        candidate.level, candidate.priority, candidate.category_hint = classify_hierarchy_level(
+            candidate,
+            image_size,
+        )
+        if candidate.level <= 2:
+            synthetic.append(candidate)
+            next_id += 1
+
+    return synthetic
+
+
+def is_parent_level(region: Region) -> bool:
+    hint = region.category_hint.lower()
+    return (
+        region.level <= 1
+        or "layout" in hint
+        or "spacing" in hint
+        or "background" in hint
+        or "safe-area" in hint
+        or "gradient" in hint
+    )
+
+
+def apply_hierarchy(raw_regions: list[Region], image_size: tuple[int, int]) -> tuple[list[Region], list[Region], list[Region]]:
+    for region in raw_regions:
+        region.level, region.priority, region.category_hint = classify_hierarchy_level(
+            region,
+            image_size,
+        )
+        region.report_group = f"region-{region.region_id}"
+
+    synthetic_groups = grouped_regions(raw_regions, image_size)
+    parent_candidates = sorted(
+        [*synthetic_groups, *[region for region in raw_regions if is_parent_level(region)]],
+        key=lambda region: (region.level, -region.priority, region.y, region.x),
+    )
+
+    reported: list[Region] = []
+    for group in synthetic_groups:
+        reported.append(group)
+        for region in raw_regions:
+            if region.region_id in group.source_region_ids:
+                region.parent_id = group.region_id
+                region.suppressed_by = group.region_id
+                region.report_group = group.report_group
+
+    for region in raw_regions:
+        if region.suppressed_by is not None:
+            continue
+
+        for parent in parent_candidates:
+            if parent.region_id == region.region_id:
+                continue
+            if parent.level >= region.level:
+                continue
+            if not contains_region(parent, region, padding=4):
+                continue
+            if is_parent_level(parent):
+                region.parent_id = parent.region_id
+                region.suppressed_by = parent.region_id
+                region.report_group = parent.report_group or f"region-{parent.region_id}"
+                break
+
+        if region.suppressed_by is None:
+            reported.append(region)
+
+    reported.sort(key=lambda region: (region.level, -region.priority, region.y, region.x))
+    for report_id, region in enumerate(reported, start=1):
+        region.report_id = report_id
+
+    suppressed = [region for region in raw_regions if region.suppressed_by is not None]
+    suppressed.sort(key=lambda region: (region.suppressed_by or 0, region.y, region.x))
+
+    return raw_regions, reported, suppressed
 
 
 def draw_annotations(actual: Image.Image, regions: list[Region]) -> Image.Image:
@@ -244,7 +504,7 @@ def draw_annotations(actual: Image.Image, regions: list[Region]) -> Image.Image:
         y1 = region.y
         x2 = region.x + region.width
         y2 = region.y + region.height
-        label = str(region.region_id)
+        label = str(region.report_id or region.region_id)
 
         draw.rectangle((x1, y1, x2, y2), outline=(255, 36, 36), width=2)
         text_bbox = draw.textbbox((0, 0), label, font=font)
@@ -281,22 +541,50 @@ def save_regions(
     min_area: int,
     merge_gap: int,
     regions: list[Region],
+    reported_regions: list[Region],
+    suppressed_regions: list[Region],
 ) -> None:
+    def region_payload(region: Region) -> dict[str, object]:
+        return {
+            "id": region.region_id,
+            "report_id": region.report_id,
+            "x": region.x,
+            "y": region.y,
+            "width": region.width,
+            "height": region.height,
+            "area": region.area,
+            "mean_delta": region.mean_delta,
+            "max_delta": region.max_delta,
+            "category_hint": region.category_hint,
+            "level": region.level,
+            "parent_id": region.parent_id,
+            "priority": region.priority,
+            "suppressed_by": region.suppressed_by,
+            "report_group": region.report_group,
+            "source_region_ids": list(region.source_region_ids),
+        }
+
     payload = {
         "actual": str(actual_path),
         "expected": str(expected_path),
+        "audit_order": "top-down",
         "audit_focus": (
             "UI/UX structure and visual fidelity: module position, size, border, "
             "background, color, gradient, spacing, margin, padding, typography metrics, "
-            "icon/image size, alignment, and visual state."
+            "icon/image size, alignment, screen edges, safe areas, and visual state."
         ),
         "ignored_by_default": [
             "copy-only text differences",
             "dynamic data differences",
             "timestamps and counters",
             "fetched labels or names",
+            "device/system UI chrome",
             "rasterization-only noise",
         ],
+        "hierarchy_policy": (
+            "Report page, edge, and parent-module differences before child elements. "
+            "Suppress child regions when a parent layout/spacing/background/edge issue explains them."
+        ),
         "actual_size": {"width": actual_size[0], "height": actual_size[1]},
         "expected_size": {"width": expected_size[0], "height": expected_size[1]},
         "parameters": {
@@ -304,20 +592,9 @@ def save_regions(
             "min_area": min_area,
             "merge_gap": merge_gap,
         },
-        "regions": [
-            {
-                "id": region.region_id,
-                "x": region.x,
-                "y": region.y,
-                "width": region.width,
-                "height": region.height,
-                "area": region.area,
-                "mean_delta": region.mean_delta,
-                "max_delta": region.max_delta,
-                "category_hint": region.category_hint,
-            }
-            for region in regions
-        ],
+        "regions": [region_payload(region) for region in regions],
+        "reported_regions": [region_payload(region) for region in reported_regions],
+        "suppressed_regions": [region_payload(region) for region in suppressed_regions],
     }
     (out_dir / "regions.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -343,8 +620,9 @@ def main() -> int:
     components = connected_components(mask, args.min_area)
     merged = merge_components(components, args.merge_gap)
     regions = make_regions(merged, delta, args.max_regions)
+    regions, reported_regions, suppressed_regions = apply_hierarchy(regions, actual_image.size)
 
-    annotated = draw_annotations(actual_image, regions)
+    annotated = draw_annotations(actual_image, reported_regions)
     heatmap = draw_heatmap(delta)
 
     annotated.save(out_dir / "annotated_actual.png")
@@ -359,9 +637,15 @@ def main() -> int:
         min_area=args.min_area,
         merge_gap=args.merge_gap,
         regions=regions,
+        reported_regions=reported_regions,
+        suppressed_regions=suppressed_regions,
     )
 
-    print(f"Wrote {len(regions)} region(s) to {out_dir}")
+    print(
+        f"Wrote {len(reported_regions)} reported region(s), "
+        f"{len(suppressed_regions)} suppressed region(s), "
+        f"{len(regions)} raw region(s) to {out_dir}"
+    )
     print(f"- {out_dir / 'annotated_actual.png'}")
     print(f"- {out_dir / 'diff_heatmap.png'}")
     print(f"- {out_dir / 'regions.json'}")
