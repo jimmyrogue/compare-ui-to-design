@@ -109,13 +109,15 @@ Outputs:
 - `report/region_crops/`
 - `report/regions.json`
 
-The default engine is node-first. It compares UI nodes and their hierarchy first, then uses RGB pixel distance, CIE Lab perceptual color distance, local structural dissimilarity, and Sobel edge/stroke delta as evidence. If node JSON is available, pass it with `--expected-nodes` and `--actual-nodes`; otherwise the CLI falls back to lightweight screenshot node proposals.
+The default engine is visual-first. It uses RGB pixel distance, CIE Lab perceptual color distance, local structural dissimilarity, and Sobel edge/stroke delta to create screenshot-backed `visual_candidates` first. Figma/design nodes, Chrome/runtime nodes, and implementation evidence resolve the candidate target and likely root cause; they do not replace or suppress visible screenshot mismatches.
 
-`regions.json` contains issue-centered fields: `issues`, `actionable_issues`, `deferred_visual_issues`, `ui_nodes`, `node_matches`, and `raw_pixel_regions`. `reported_regions` and `focus_regions` remain for annotation compatibility, but they are issue-backed marker boxes. Pixel regions are kept as evidence/debug data, not the main decision layer.
+If node JSON is available, pass it with `--expected-nodes` and `--actual-nodes`. Use `--implementation-evidence` for code or tool output such as SwiftUI frame/padding/offset checks, DOM style, source paths, or static alignment notes. Static metadata can become `implementation_hint` evidence or `metadata_only_findings`, but the actual screenshot remains the fidelity ground truth.
+
+`regions.json` contains issue-centered fields: `visual_candidates`, `resolved_issues`, `issues`, `actionable_issues`, `deferred_visual_issues`, `unresolved_visual_candidates`, `metadata_only_findings`, `ui_nodes`, `node_matches`, `implementation_evidence`, and `raw_pixel_regions`. `visual_candidates` is the screenshot-backed investigation pool and may include eligible raw detail candidates that parent hierarchy markers suppressed. `reported_regions` and `focus_regions` remain for annotation compatibility, but they are issue-backed marker boxes.
 
 Report order is intentionally geometry-first: size/layout dimensions, position/alignment, relative relationship/spacing, image/icon consistency, font metrics/typography, foreground color, background color, gradient, then shadow/effects. `--report-mode detail` includes tiers 1-5 by default, so color-only backgrounds and decorative effects do not dominate the marked screenshot.
 
-The JSON also includes `audit_order: "top-down"`, `reported_regions`, `depth_regions`, `parent_regions`, `detail_regions`, `raw_regions`, and `suppressed_regions`. Use `actionable_issues` for the main audit and `deferred_visual_issues` for background/color/gradient/shadow differences that should not outrank layout, text, or icon problems.
+The JSON also includes `audit_order: "top-down"`, `reported_regions`, `depth_regions`, `parent_regions`, `detail_regions`, `raw_regions`, and `suppressed_regions`. Use screenshot-backed `actionable_issues` for the main audit and `deferred_visual_issues` for background/color/gradient/shadow differences that should not outrank layout, text, or icon problems. Screenshot-parser fallback nodes are lightweight localization proposals, not external Figma/Chrome/code evidence. Treat `metadata_only_findings` as non-user-facing evidence unless a visual candidate supports it.
 
 Use `--node-mode pixel` to run the legacy pixel-region decision path. Use `--report-mode structure|module|detail|raw` to drill into deeper layers while keeping top-down context. `--hierarchy-depth 1..9` is the advanced numeric form and overrides the preset when both are provided. A practical sequence is:
 
@@ -134,7 +136,7 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 
 Reported regions can include `finding_summary`, `review_guidance`, `edge_evidence`, and `suppressed_child_count`. Agents should use those fields directly as script evidence. A broad parent/module region is not a false positive just because it covers many child diffs; for example, `edge_evidence.margins.right = 0` means the actual app-owned region reaches the right screenshot edge and must be checked for missing side gutter, safe-area padding, or clipping against the design.
 
-Each run also returns paired visual evidence. `annotated_actual.png` and `annotated_expected.png` use the same marker numbers and coordinates, so agents can compare the actual and design views directly. `annotated_depth_*` shows the selected drilldown layer, and `annotated_raw_*` shows every raw pixel-evidence candidate. When source sizes differ, `annotated_expected.png` is the normalized design image in the actual screenshot coordinate space; `regions.json.normalization` records the original design size, scale, offset, padding, and `cropped: false`. `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, `diff_graymap.png`, `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` show the finer changed-pixel evidence that supports node-level issues without turning those pixels into extra report rows. `region_crops/` contains paired actual/design/diff crops for reported markers and is the fastest way to verify the exact visual property before writing the audit.
+Each run also returns paired visual evidence. `annotated_actual.png` and `annotated_expected.png` use the same marker numbers and coordinates, so agents can compare the actual and design views directly. `annotated_depth_*` shows the selected drilldown layer, and `annotated_raw_*` shows every raw pixel-evidence candidate. When source sizes differ, `annotated_expected.png` is the normalized design image in the actual screenshot coordinate space; `regions.json.normalization` records the original design size, scale, offset, padding, and `cropped: false`. `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, `diff_graymap.png`, `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` show the changed pixels behind each visual candidate. `region_crops/` contains paired actual/design/diff crops for reported markers and is the fastest way to verify the exact visual property before calling Figma, Chrome DevTools, or source search for the candidate area.
 
 ## Project Layout
 
@@ -302,13 +304,15 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 - `report/region_crops/`
 - `report/regions.json`
 
-默认引擎现在是 node-first：先比较 UI 节点和层级关系，再把 RGB 像素距离、CIE Lab 感知色差、局部结构差异和 Sobel 边缘/描边差异作为证据。已有节点树时，用 `--expected-nodes` 和 `--actual-nodes` 传入；没有节点树时，CLI 会回退到轻量截图节点候选。
+默认引擎现在是 visual-first：先用 RGB 像素距离、CIE Lab 感知色差、局部结构差异和 Sobel 边缘/描边差异生成有截图证据的 `visual_candidates`。Figma/设计节点、Chrome/runtime 节点和代码实现证据只用于解析候选问题的目标节点、归因和修复线索，不能替代或压掉真实截图中的可见问题。
 
-`regions.json` 会包含 issue-centered 字段：`issues`、`actionable_issues`、`deferred_visual_issues`、`ui_nodes`、`node_matches` 和 `raw_pixel_regions`。`reported_regions` 和 `focus_regions` 仍然保留，用于兼容标注图，但它们是 issue-backed marker boxes。像素区域只作为 evidence/debug 数据，不再作为主决策层。
+已有节点树时，用 `--expected-nodes` 和 `--actual-nodes` 传入。`--implementation-evidence` 用于传入代码或工具检查结果，例如 SwiftUI frame/padding/offset、DOM style、source path 或静态对齐说明。静态 metadata 可以成为 implementation hint 或 `metadata_only_findings`，但真实截图才是 UI fidelity 的 ground truth。
+
+`regions.json` 会包含 issue-centered 字段：`visual_candidates`、`resolved_issues`、`issues`、`actionable_issues`、`deferred_visual_issues`、`unresolved_visual_candidates`、`metadata_only_findings`、`ui_nodes`、`node_matches`、`implementation_evidence` 和 `raw_pixel_regions`。`visual_candidates` 是有截图证据的调查候选池，可能包含被父级层级 marker 压住、但仍值得检查的 raw detail candidate。`reported_regions` 和 `focus_regions` 仍然保留，用于兼容标注图，但它们是 issue-backed marker boxes。
 
 报告顺序会优先看几何和结构：尺寸/布局、位置/对齐、相对关系/间距、图片/icon 一致性、字体指标/排版、前景色、背景色、渐变、阴影/效果。`--report-mode detail` 默认只包含 1-5 层，所以纯背景色和装饰效果不会主导标注截图。
 
-JSON 还会包含 `audit_order: "top-down"`、`reported_regions`、`depth_regions`、`parent_regions`、`detail_regions`、`raw_regions` 和 `suppressed_regions`。主报告应优先使用 `actionable_issues`，背景色、渐变、阴影等低优先级视觉差异放在 `deferred_visual_issues`。
+JSON 还会包含 `audit_order: "top-down"`、`reported_regions`、`depth_regions`、`parent_regions`、`detail_regions`、`raw_regions` 和 `suppressed_regions`。主报告应优先使用有截图证据的 `actionable_issues`，背景色、渐变、阴影等低优先级视觉差异放在 `deferred_visual_issues`。截图 fallback parser 节点只是轻量定位 proposal，不是外部 Figma/Chrome/code 证据。`metadata_only_findings` 只是静态证据，除非有 visual candidate 支持，否则不应该作为用户级 UI 问题报告。
 
 使用 `--node-mode pixel` 可以运行旧的 pixel-region 决策路径。使用 `--report-mode structure|module|detail|raw` 可以在保留 top-down 上下文的同时继续向细节层钻取。`--hierarchy-depth 1..9` 是高级数字形式；如果 preset 和数字同时传入，数字优先。常用命令：
 
@@ -327,7 +331,7 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 
 `reported_regions` 可能包含 `finding_summary`、`review_guidance`、`edge_evidence` 和 `suppressed_child_count`。Agent 应该把这些字段当作脚本证据直接使用。一个较大的父级/模块区域不应该因为覆盖了很多子级 diff 就被当成误报；例如 `edge_evidence.margins.right = 0` 表示实际 app 区域已经贴到截图右边缘，应该检查是否缺少右侧 gutter、安全区 padding，或者是否发生裁切。
 
-每次运行还会返回成对的视觉证据。`annotated_actual.png` 和 `annotated_expected.png` 使用相同编号和坐标，方便 agent 直接对照实际图与设计稿。`annotated_depth_*` 展示当前选择的钻取层级，`annotated_raw_*` 展示所有 raw pixel evidence。当源图尺寸不一致时，`annotated_expected.png` 是已经归一化到实际截图坐标系的设计稿；`regions.json.normalization` 会记录原始设计稿尺寸、缩放比例、offset、padding，以及 `cropped: false`。`evidence_overlay_actual.png`、`evidence_overlay_expected.png`、`diff_heatmap.png`、`diff_graymap.png`、`diff_color_delta.png`、`diff_structure.png` 和 `diff_edges.png` 用来展示支撑节点级 issue 的精细像素证据，但这些像素证据本身不应该被展开成额外报告行。`region_crops/` 会为上报 marker 生成实际图/设计图/diff 的局部裁剪，是确认具体视觉属性最快的入口。
+每次运行还会返回成对的视觉证据。`annotated_actual.png` 和 `annotated_expected.png` 使用相同编号和坐标，方便 agent 直接对照实际图与设计稿。`annotated_depth_*` 展示当前选择的钻取层级，`annotated_raw_*` 展示所有 raw pixel evidence。当源图尺寸不一致时，`annotated_expected.png` 是已经归一化到实际截图坐标系的设计稿；`regions.json.normalization` 会记录原始设计稿尺寸、缩放比例、offset、padding，以及 `cropped: false`。`evidence_overlay_actual.png`、`evidence_overlay_expected.png`、`diff_heatmap.png`、`diff_graymap.png`、`diff_color_delta.png`、`diff_structure.png` 和 `diff_edges.png` 用来展示每个 visual candidate 背后的变化像素。`region_crops/` 会为上报 marker 生成实际图/设计图/diff 的局部裁剪，是确认具体视觉属性、再针对该区域调用 Figma/Chrome/代码搜索的最快入口。
 
 ## 项目结构
 

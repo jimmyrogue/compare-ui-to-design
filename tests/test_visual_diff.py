@@ -65,6 +65,11 @@ def save_nodes(path, nodes):
     return path
 
 
+def save_implementation_evidence(path, evidence):
+    path.write_text(json.dumps({"implementation_evidence": evidence}) + "\n", encoding="utf-8")
+    return path
+
+
 def resize_filter():
     try:
         return Image.Resampling.LANCZOS
@@ -72,7 +77,7 @@ def resize_filter():
         return Image.LANCZOS
 
 
-def test_node_json_normalizes_expected_boxes_and_reports_issue(tmp_path):
+def test_node_json_normalizes_expected_boxes_as_metadata_only_without_visual_diff(tmp_path):
     expected_path = tmp_path / "expected.png"
     actual_path = tmp_path / "actual.png"
     expected_nodes_path = tmp_path / "expected_nodes.json"
@@ -99,19 +104,19 @@ def test_node_json_normalizes_expected_boxes_and_reports_issue(tmp_path):
         str(actual_nodes_path),
     )
 
-    assert payload["diff_engine"]["mode"] == "node-first"
+    assert payload["diff_engine"]["mode"] == "visual-first"
     assert payload["parameters"]["node_mode"] == "auto"
     expected_button = next(node for node in payload["ui_nodes"]["expected"] if node["id"] == "button")
     assert expected_button["bbox"] == {"x": 20, "y": 20, "width": 60, "height": 20}
-    issue = payload["actionable_issues"][0]
-    assert issue["target"]["id"] == "button"
-    assert issue["category"] == "position / alignment"
-    assert issue["delta"]["dx"] == 4
-    assert issue["evidence"]["pixel_diff_is_evidence_only"] is True
-    assert payload["reported_regions"][0]["issue"]["issue_id"] == issue["issue_id"]
+    assert payload["actionable_issues"] == []
+    finding = payload["metadata_only_findings"][0]
+    assert finding["target"]["id"] == "button"
+    assert finding["category"] == "position / alignment"
+    assert finding["delta"]["dx"] == 4
+    assert finding["metadata_only"] is True
 
 
-def test_node_diff_reports_child_residual_instead_of_parent(tmp_path):
+def test_node_diff_child_residual_is_metadata_only_without_visual_diff(tmp_path):
     expected_path = tmp_path / "expected.png"
     actual_path = tmp_path / "actual.png"
     expected_nodes_path = tmp_path / "expected_nodes.json"
@@ -144,14 +149,14 @@ def test_node_diff_reports_child_residual_instead_of_parent(tmp_path):
         str(actual_nodes_path),
     )
 
-    actionable_ids = [issue["target"]["id"] for issue in payload["actionable_issues"]]
-    assert actionable_ids == ["badge"]
-    issue = payload["actionable_issues"][0]
-    assert issue["residual_delta"]["dx"] == 6
-    assert issue["parent_delta"]["dx"] == 0
+    assert payload["actionable_issues"] == []
+    finding = payload["metadata_only_findings"][0]
+    assert finding["target"]["id"] == "badge"
+    assert finding["residual_delta"]["dx"] == 6
+    assert finding["parent_delta"]["dx"] == 0
 
 
-def test_node_diff_suppresses_children_when_parent_shift_explains_them(tmp_path):
+def test_node_parent_shift_is_metadata_only_and_keeps_suppressed_children(tmp_path):
     expected_path = tmp_path / "expected.png"
     actual_path = tmp_path / "actual.png"
     expected_nodes_path = tmp_path / "expected_nodes.json"
@@ -186,8 +191,10 @@ def test_node_diff_suppresses_children_when_parent_shift_explains_them(tmp_path)
         str(actual_nodes_path),
     )
 
-    assert [issue["target"]["id"] for issue in payload["actionable_issues"]] == ["card"]
-    suppressed = payload["actionable_issues"][0]["suppressed_children"]
+    assert payload["actionable_issues"] == []
+    finding = payload["metadata_only_findings"][0]
+    assert finding["target"]["id"] == "card"
+    suppressed = finding["suppressed_children"]
     assert {item["node"] for item in suppressed} == {"title", "icon"}
 
 
@@ -218,9 +225,10 @@ def test_node_diff_reports_missing_and_extra_nodes(tmp_path):
         str(actual_nodes_path),
     )
 
-    issue_types = {issue["issue_type"] for issue in payload["actionable_issues"]}
+    assert payload["actionable_issues"] == []
+    issue_types = {issue["issue_type"] for issue in payload["metadata_only_findings"]}
     assert issue_types == {"missing", "extra"}
-    categories = {issue["category"] for issue in payload["actionable_issues"]}
+    categories = {issue["category"] for issue in payload["metadata_only_findings"]}
     assert categories == {"missing element", "extra element"}
 
 
@@ -345,6 +353,220 @@ def test_local_search_reports_visual_shift_inside_stable_node_box(tmp_path):
     assert issue["delta"]["dx"] == 6
     assert issue["target"]["box_actual"]["x"] == 32
     assert issue["evidence"]["node_actual_box"]["x"] == 26
+    assert issue["evidence"]["evidence_resolution"] == "resolved_to_detail_node"
+
+
+def test_static_implementation_agreement_cannot_suppress_visual_issue(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+    implementation_evidence_path = tmp_path / "implementation_evidence.json"
+
+    expected = save_image(expected_path, size=(120, 90))
+    actual = save_image(actual_path, size=(120, 90))
+    ImageDraw.Draw(expected).ellipse((28, 28, 50, 50), outline=(20, 20, 20), width=3)
+    ImageDraw.Draw(actual).ellipse((34, 28, 56, 50), outline=(20, 20, 20), width=3)
+    expected.save(expected_path)
+    actual.save(actual_path)
+    save_nodes(expected_nodes_path, [{"id": "ring", "name": "Progress Ring", "kind": "control", "bbox": [26, 26, 28, 28]}])
+    save_nodes(actual_nodes_path, [{"id": "ring-runtime", "name": "Progress Ring", "kind": "control", "bbox": [26, 26, 28, 28]}])
+    save_implementation_evidence(
+        implementation_evidence_path,
+        [
+            {
+                "id": "swiftui-frame",
+                "target_node_id": "ring",
+                "kind": "swiftui-frame",
+                "bbox": [26, 26, 28, 28],
+                "source_path": "HomeView.swift:120",
+                "static_agreement": True,
+                "properties": {"frame": "28x28"},
+            }
+        ],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+        "--implementation-evidence",
+        str(implementation_evidence_path),
+    )
+
+    issue = payload["actionable_issues"][0]
+    assert issue["target"]["id"] == "ring"
+    assert issue["evidence"]["static_evidence_cannot_suppress"] is True
+    assert issue["evidence"]["evidence_resolution"] == "rendered visual mismatch with static implementation agreement"
+    assert issue["evidence"]["linked_implementation_evidence"][0]["id"] == "swiftui-frame"
+    assert "static implementation evidence agrees" in issue["diagnosis"]
+
+
+def test_matched_status_does_not_claim_static_implementation_agreement(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+    implementation_evidence_path = tmp_path / "implementation_evidence.json"
+
+    expected = save_image(expected_path, size=(120, 90))
+    actual = save_image(actual_path, size=(120, 90))
+    ImageDraw.Draw(expected).ellipse((28, 28, 50, 50), outline=(20, 20, 20), width=3)
+    ImageDraw.Draw(actual).ellipse((34, 28, 56, 50), outline=(20, 20, 20), width=3)
+    expected.save(expected_path)
+    actual.save(actual_path)
+    save_nodes(expected_nodes_path, [{"id": "ring", "name": "Progress Ring", "kind": "control", "bbox": [26, 26, 28, 28]}])
+    save_nodes(actual_nodes_path, [{"id": "ring-runtime", "name": "Progress Ring", "kind": "control", "bbox": [26, 26, 28, 28]}])
+    save_implementation_evidence(
+        implementation_evidence_path,
+        [
+            {
+                "id": "candidate-link",
+                "target_node_id": "ring",
+                "kind": "swiftui-frame",
+                "bbox": [26, 26, 28, 28],
+                "source_path": "HomeView.swift:120",
+                "status": "matched",
+            }
+        ],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+        "--implementation-evidence",
+        str(implementation_evidence_path),
+    )
+
+    issue = payload["actionable_issues"][0]
+    assert issue["evidence"]["linked_implementation_evidence"][0]["id"] == "candidate-link"
+    assert issue["evidence"]["static_evidence_cannot_suppress"] is False
+    assert issue["evidence"]["evidence_resolution"] != "rendered visual mismatch with static implementation agreement"
+    assert "static_agreement" not in issue["evidence"]["linked_implementation_evidence"][0]["properties"]
+
+
+def test_implementation_evidence_without_visual_candidate_is_metadata_only(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    implementation_evidence_path = tmp_path / "implementation_evidence.json"
+
+    save_image(expected_path, size=(120, 90))
+    save_image(actual_path, size=(120, 90))
+    save_implementation_evidence(
+        implementation_evidence_path,
+        [
+            {
+                "id": "code-only-frame",
+                "target_node_id": "card",
+                "kind": "swiftui-frame",
+                "bbox": [20, 20, 40, 24],
+                "source_path": "HomeView.swift:42",
+                "matches_expected": False,
+            }
+        ],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--implementation-evidence",
+        str(implementation_evidence_path),
+    )
+
+    assert payload["actionable_issues"] == []
+    finding = payload["metadata_only_findings"][0]
+    assert finding["metadata_only"] is True
+    assert finding["implementation_evidence"]["id"] == "code-only-frame"
+
+
+def test_figma_instance_children_resolve_visual_candidate_to_leaf_node(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    expected = save_image(expected_path, size=(140, 100))
+    actual = save_image(actual_path, size=(140, 100))
+    ImageDraw.Draw(expected).rectangle((34, 34, 48, 48), fill=(20, 20, 20))
+    ImageDraw.Draw(actual).rectangle((40, 34, 54, 48), fill=(20, 20, 20))
+    expected.save(expected_path)
+    actual.save(actual_path)
+    save_nodes(
+        expected_nodes_path,
+        [
+            {
+                "id": "instance",
+                "name": "Home Screen Widgets01",
+                "kind": "container",
+                "bbox": [20, 20, 80, 60],
+                "children": [
+                    {"id": "leaf-icon", "name": "Badge Icon", "kind": "icon", "bbox": [30, 30, 24, 24]},
+                ],
+            }
+        ],
+    )
+    save_nodes(actual_nodes_path, [{"id": "runtime-icon", "name": "Badge Icon", "kind": "icon", "bbox": [30, 30, 24, 24]}])
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    issue = payload["actionable_issues"][0]
+    assert issue["target"]["id"] == "leaf-icon"
+    assert issue["evidence"]["evidence_resolution"] == "resolved_to_detail_node"
+    linked_expected_ids = {node["id"] for node in issue["evidence"]["linked_expected_nodes"]}
+    assert {"instance", "leaf-icon"}.issubset(linked_expected_ids)
+
+
+def test_figma_instance_without_children_stays_unresolved_visual_candidate(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    expected = save_image(expected_path, size=(140, 100))
+    actual = save_image(actual_path, size=(140, 100))
+    ImageDraw.Draw(expected).rectangle((34, 34, 48, 48), fill=(20, 20, 20))
+    ImageDraw.Draw(actual).rectangle((40, 34, 54, 48), fill=(20, 20, 20))
+    expected.save(expected_path)
+    actual.save(actual_path)
+    save_nodes(
+        expected_nodes_path,
+        [{"id": "instance", "name": "Home Screen Widgets01", "kind": "container", "bbox": [20, 20, 80, 60]}],
+    )
+    save_nodes(actual_nodes_path, [])
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    issue = payload["actionable_issues"][0]
+    assert issue["target"]["id"] == "instance"
+    assert issue["evidence"]["evidence_resolution"] == "resolved_to_container_or_metadata"
+    assert payload["unresolved_visual_candidates"]
+    assert "no leaf detail node confirmed" in payload["unresolved_visual_candidates"][0]["reason"]
 
 
 def test_large_background_color_diff_is_deferred_visual_issue(tmp_path):
@@ -359,7 +581,7 @@ def test_large_background_color_diff_is_deferred_visual_issue(tmp_path):
     assert payload["actionable_issues"] == []
     assert payload["deferred_visual_issues"]
     assert payload["deferred_visual_issues"][0]["category"] == "background color"
-    assert payload["deferred_visual_issues"][0]["evidence"]["pixel_diff_is_evidence_only"] is True
+    assert payload["deferred_visual_issues"][0]["evidence"]["screenshot_is_ground_truth"] is True
 
 
 def test_screenshot_fallback_reports_shifted_icon_node(tmp_path):
@@ -375,10 +597,45 @@ def test_screenshot_fallback_reports_shifted_icon_node(tmp_path):
 
     _, payload = run_diff(tmp_path, actual_path, expected_path)
 
-    assert payload["diff_engine"]["mode"] == "node-first"
+    assert payload["diff_engine"]["mode"] == "visual-first"
+    assert payload["visual_candidates"]
     assert any(node["source_method"] == "expected-screenshot-parser" for node in payload["ui_nodes"]["expected"])
     assert any(issue["category"] == "position / alignment" for issue in payload["actionable_issues"])
+    assert all(
+        issue["evidence"]["evidence_resolution"] != "resolved_to_container_or_metadata"
+        for issue in payload["actionable_issues"]
+    )
     assert payload["raw_pixel_regions"]
+
+
+def test_visual_candidates_keep_suppressed_detail_regions(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(250, 250, 250), size=(220, 160))
+    actual = save_image(actual_path, color=(250, 250, 250), size=(220, 160))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+    expected_draw.rounded_rectangle((30, 30, 190, 130), radius=12, fill=(230, 245, 235))
+    actual_draw.rounded_rectangle((30, 30, 190, 130), radius=12, fill=(212, 236, 222))
+    expected_draw.rectangle((150, 74, 170, 94), fill=(10, 10, 10))
+    actual_draw.rectangle((158, 74, 178, 94), fill=(10, 10, 10))
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path)
+
+    assert payload["suppressed_regions"]
+    assert any(
+        candidate["priority_category"] == "image / icon consistency"
+        and candidate["suppressed_by"] is not None
+        for candidate in payload["visual_candidates"]
+    )
+    assert any(
+        issue["category"] == "image / icon consistency"
+        and issue["evidence"]["visual_candidate"]["bbox"]["width"] <= 40
+        for issue in payload["actionable_issues"]
+    )
 
 
 def test_detects_color_spacing_and_icon_differences(tmp_path):

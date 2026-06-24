@@ -32,16 +32,19 @@ Do not use `Content` as a primary category. If text or data differs, classify on
 ## Region Reporting
 
 - Coordinates are relative to the top-left corner of the actual screenshot.
-- Prefer `actionable_issues` over raw regions. Use each issue's target node, expected/actual box, delta, parent delta, residual delta, diagnosis, suggested fix, and evidence.
+- Prefer screenshot-backed `actionable_issues` over raw regions. Use each issue's target node, expected/actual box, delta, parent delta, residual delta, diagnosis, suggested fix, and evidence.
 - Use `x`, `y`, `width`, and `height` for every marker region when citing annotated screenshots.
 - Compare `annotated_actual.png` and `annotated_expected.png` as a pair. Matching marker numbers and coordinates show the same screenshot location in actual and normalized design.
 - Check `regions.json.normalization` when source dimensions differ. The actual screenshot is the coordinate baseline; the design is proportionally fit without cropping, and any padding/offset is recorded there.
-- Use `ui_nodes` and `node_matches` to understand which expected node matched which actual node. Use `suppressed_children` to explain parent-vs-child attribution.
-- Use `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` to understand where changed pixels support a node-level issue. Do not turn every evidence pixel into a separate report row.
+- Use `visual_candidates` as the first-pass screenshot evidence. It can include eligible raw detail candidates that were suppressed by parent hierarchy markers. Use real design/runtime nodes, `node_matches`, and `implementation_evidence` only to resolve the candidate target, confidence, and likely root cause.
+- Use `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, and `diff_graymap.png` to understand where changed pixels support a visual candidate. Do not turn every evidence pixel into a separate report row.
 - Use `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` to distinguish color/fill changes from structural layout changes and edge/stroke movement.
 - In detail mode, expect object-level child node issues when a broad card or row contains an independent image, icon, compact icon group, or circular control mismatch. Prefer those child issues for the specific fix while keeping the parent node as context.
 - Open `region_crops/` for reported markers before writing the final issue. The crop pair is usually the clearest evidence for small typography, icon, border, radius, shadow, color, and alignment problems.
 - Treat `raw_pixel_regions` and `raw_regions` as pixel evidence/debug data unless `--node-mode pixel` was explicitly used.
+- Treat screenshot-parser fallback nodes as localization proposals. They can help identify a likely detail target, but they are not external Figma, Chrome, or implementation evidence.
+- Treat `metadata_only_findings` as static node/code evidence without screenshot support. Do not report them as user-facing UI issues unless a visual candidate supports them.
+- If an issue has `evidence_resolution = "rendered visual mismatch with static implementation agreement"`, keep the screenshot-backed issue. Matching Figma metadata, DOM style, or code constants cannot prove that rendered pixels are correct.
 - In drilldown reports, use `focus_regions` and `annotated_depth_*` for the selected detail layer. Use `depth_regions` when you need the full context up to that depth.
 - If a reported region has `finding_summary`, use it as the first script-backed interpretation of that region. Do not replace it with a guess that the region is noise unless there is concrete capture/setup evidence.
 - If a reported region has `priority_tier`, `priority_category`, `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`, use them to prioritize review order and explain why the region was surfaced. Treat `element_kind` as a hypothesis until verified against the actual/design crop pair.

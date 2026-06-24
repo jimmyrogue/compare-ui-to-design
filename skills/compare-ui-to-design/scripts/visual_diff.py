@@ -166,6 +166,21 @@ class UIIssue:
     report_id: int | None = None
 
 
+@dataclass
+class ImplementationEvidence:
+    evidence_id: str
+    name: str
+    kind: str
+    source_method: str
+    bbox: tuple[int, int, int, int] | None = None
+    target_node_id: str | None = None
+    candidate_id: str | None = None
+    source_path: str | None = None
+    properties: dict[str, object] = field(default_factory=dict)
+    confidence: float = 1.0
+    raw: dict[str, object] = field(default_factory=dict)
+
+
 def parse_args() -> argparse.Namespace:
     def hierarchy_depth(value: str) -> int:
         depth = int(value)
@@ -226,9 +241,8 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "node", "pixel"),
         default="auto",
         help=(
-            "Decision mode. auto uses UI node diff when node inputs or screenshot proposals are "
-            "available, node requires node-first decisions, and pixel preserves legacy pixel-region "
-            "decisions. Default: auto."
+            "Decision mode. auto/node use visual-first screenshot candidates with optional node "
+            "evidence resolution; pixel preserves legacy pixel-region decisions. Default: auto."
         ),
     )
     parser.add_argument(
@@ -240,6 +254,14 @@ def parse_args() -> argparse.Namespace:
         "--actual-nodes",
         default=None,
         help="Optional actual/runtime UI node JSON. Boxes are interpreted in actual screenshot coordinates.",
+    )
+    parser.add_argument(
+        "--implementation-evidence",
+        default=None,
+        help=(
+            "Optional implementation evidence JSON from code, Figma, Chrome DevTools, or other tools. "
+            "Evidence is linked to screenshot candidates and cannot suppress visible screenshot issues."
+        ),
     )
     return parser.parse_args()
 
@@ -528,6 +550,115 @@ def load_ui_nodes(
             )
         )
     return build_node_hierarchy(nodes, image_size, source_method)
+
+
+def iter_evidence_payloads(payload: object) -> Iterable[dict[str, object]]:
+    if isinstance(payload, dict):
+        for key in ("implementation_evidence", "evidence", "items", "findings", "nodes"):
+            if isinstance(payload.get(key), list):
+                for item in payload[key]:
+                    yield from iter_evidence_payloads(item)
+                return
+        yield payload
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from iter_evidence_payloads(item)
+
+
+def evidence_static_agreement(payload: dict[str, object]) -> bool:
+    candidates = [
+        payload.get("static_agreement"),
+        payload.get("matches_expected"),
+        payload.get("matches_design"),
+        payload.get("agreement"),
+        payload.get("static_status"),
+    ]
+    properties = payload.get("properties")
+    if isinstance(properties, dict):
+        candidates.extend(
+            [
+                properties.get("static_agreement"),
+                properties.get("matches_expected"),
+                properties.get("matches_design"),
+                properties.get("agreement"),
+                properties.get("static_status"),
+            ]
+        )
+    for value in candidates:
+        if isinstance(value, bool) and value:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {
+            "match",
+            "matches",
+            "matched",
+            "aligned",
+            "agree",
+            "agrees",
+            "agreement",
+            "same",
+            "equal",
+            "true",
+        }:
+            return True
+    return False
+
+
+def load_implementation_evidence(
+    path: Path | None,
+    image_size: tuple[int, int],
+) -> list[ImplementationEvidence]:
+    if path is None:
+        return []
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    evidence: list[ImplementationEvidence] = []
+    used_ids: set[str] = set()
+    for index, item in enumerate(iter_evidence_payloads(data), start=1):
+        if not isinstance(item, dict):
+            continue
+        raw_id = str(item.get("id") or item.get("evidence_id") or item.get("name") or f"implementation-{index}")
+        evidence_id = raw_id
+        suffix = 2
+        while evidence_id in used_ids:
+            evidence_id = f"{raw_id}-{suffix}"
+            suffix += 1
+        used_ids.add(evidence_id)
+        bbox_payload = extract_bbox_payload(item)
+        bbox = clamp_box(*bbox_payload, image_size) if bbox_payload is not None else None
+        properties = item.get("properties") if isinstance(item.get("properties"), dict) else {}
+        if evidence_static_agreement(item):
+            properties = {**properties, "static_agreement": True}
+        evidence.append(
+            ImplementationEvidence(
+                evidence_id=evidence_id,
+                name=str(item.get("name") or item.get("target_name") or evidence_id),
+                kind=str(item.get("kind") or item.get("type") or "implementation").strip().lower(),
+                source_method=str(item.get("source_method") or item.get("source") or "implementation-evidence"),
+                bbox=bbox,
+                target_node_id=(
+                    str(
+                        item.get("target_node_id")
+                        or item.get("node_id")
+                        or item.get("expected_node_id")
+                        or item.get("actual_node_id")
+                    )
+                    if (
+                        item.get("target_node_id")
+                        or item.get("node_id")
+                        or item.get("expected_node_id")
+                        or item.get("actual_node_id")
+                    )
+                    else None
+                ),
+                candidate_id=str(item.get("candidate_id")) if item.get("candidate_id") else None,
+                source_path=str(item.get("source_path") or item.get("file") or item.get("path") or "")
+                or None,
+                properties=properties,
+                confidence=float(item.get("confidence", 1.0)),
+                raw=item,
+            )
+        )
+    return evidence
 
 
 def build_node_hierarchy(
@@ -1748,6 +1879,80 @@ def apply_hierarchy(
     return raw_regions, reported, suppressed
 
 
+def visual_candidate_identity(region: Region) -> tuple[int, int, int, int]:
+    return region.x, region.y, region.width, region.height
+
+
+def is_detail_visual_candidate(region: Region, image_size: tuple[int, int]) -> bool:
+    image_area = image_size[0] * image_size[1]
+    if region.priority_tier >= 7:
+        return False
+    if (
+        region.element_kind in {"background/color fill", "screen-edge/safe-area"}
+        and region.priority_tier > 3
+    ):
+        return False
+    if region.bbox_area > image_area * 0.18 and region.priority_tier > 3:
+        return False
+    return (
+        region.suppressed_by is not None
+        or region.display_depth >= 4
+        or region.level >= 2
+        or region.element_kind in {
+            "icon/image detail",
+            "typography/text metrics",
+            "typography/icon stroke",
+            "border/divider",
+        }
+    )
+
+
+def visual_candidate_sort_key(
+    region: Region,
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, float, int, int, int]:
+    detail_rank = 0 if is_detail_visual_candidate(region, image_size) else 1
+    return (
+        region.priority_tier,
+        detail_rank,
+        region.display_depth,
+        -region.severity_score,
+        region.y,
+        region.x,
+        region.region_id,
+    )
+
+
+def visual_candidate_pool(
+    raw_regions: list[Region],
+    reported_regions: list[Region],
+    image_size: tuple[int, int],
+    max_regions: int,
+) -> list[Region]:
+    """Keep screenshot candidates independent from compatibility report markers."""
+    candidates = [
+        *reported_regions,
+        *[
+            region
+            for region in raw_regions
+            if is_detail_visual_candidate(region, image_size)
+        ],
+    ]
+    candidates.sort(key=lambda region: visual_candidate_sort_key(region, image_size))
+
+    selected: list[Region] = []
+    seen_boxes: set[tuple[int, int, int, int]] = set()
+    for region in candidates:
+        identity = visual_candidate_identity(region)
+        if identity in seen_boxes:
+            continue
+        selected.append(region)
+        seen_boxes.add(identity)
+        if len(selected) >= max_regions:
+            break
+    return selected
+
+
 def edge_evidence(region: Region, image_size: tuple[int, int]) -> dict[str, object]:
     image_width, image_height = image_size
     margins = {
@@ -1980,6 +2185,207 @@ def node_payload(node: UINode) -> dict[str, object]:
         "source_method": node.source_method,
         "children": node.children,
     }
+
+
+def implementation_evidence_payload(evidence: ImplementationEvidence) -> dict[str, object]:
+    return {
+        "id": evidence.evidence_id,
+        "name": evidence.name,
+        "kind": evidence.kind,
+        "source_method": evidence.source_method,
+        "bbox": box_payload(evidence.bbox),
+        "target_node_id": evidence.target_node_id,
+        "candidate_id": evidence.candidate_id,
+        "source_path": evidence.source_path,
+        "properties": evidence.properties,
+        "confidence": round(evidence.confidence, 3),
+    }
+
+
+def region_box(region: Region) -> tuple[int, int, int, int]:
+    return region.x, region.y, region.width, region.height
+
+
+def box_area(box: tuple[int, int, int, int] | None) -> int:
+    if box is None:
+        return 0
+    return max(0, box[2]) * max(0, box[3])
+
+
+def box_intersection_area(
+    a: tuple[int, int, int, int] | None,
+    b: tuple[int, int, int, int] | None,
+) -> int:
+    if a is None or b is None:
+        return 0
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(
+        0,
+        min(ay + ah, by + bh) - max(ay, by),
+    )
+
+
+def box_overlap_score(
+    a: tuple[int, int, int, int] | None,
+    b: tuple[int, int, int, int] | None,
+) -> float:
+    intersection = box_intersection_area(a, b)
+    if intersection <= 0:
+        return 0.0
+    return intersection / max(1, min(box_area(a), box_area(b)))
+
+
+def candidate_id_values(region: Region) -> set[str]:
+    return {
+        str(region.region_id),
+        f"region-{region.region_id}",
+        f"visual-{region.region_id}",
+        f"V-{region.region_id:03d}",
+    }
+
+
+def candidate_simple_payload(region: Region, mask: np.ndarray | None = None) -> dict[str, object]:
+    diff_count = None
+    diff_bbox = None
+    if mask is not None:
+        diff_count, diff_bbox = diff_pixel_evidence(region, mask)
+    return {
+        "id": f"V-{region.region_id:03d}",
+        "region_id": region.region_id,
+        "bbox": box_payload(region_box(region)),
+        "category": region.priority_category,
+        "priority_tier": region.priority_tier,
+        "element_kind": region.element_kind,
+        "severity_score": region.severity_score,
+        "confidence_score": region.confidence_score,
+        "dominant_signal": region.dominant_signal,
+        "diff_pixel_count": diff_count,
+        "diff_pixel_bbox": diff_bbox,
+    }
+
+
+def is_detail_node(node: UINode) -> bool:
+    return node.kind in {"text", "icon", "image", "control", "unknown"} and node.kind != "screen"
+
+
+def is_screenshot_parser_node(node: UINode) -> bool:
+    return node.source_method.endswith("-screenshot-parser")
+
+
+def is_visual_detail_target_node(node: UINode) -> bool:
+    if is_detail_node(node):
+        return True
+    if not is_screenshot_parser_node(node) or node.kind != "container":
+        return False
+    return max(node.width, node.height) <= 128 and node.bbox_area <= 96 * 96
+
+
+def is_broad_screenshot_parser_node(node: UINode) -> bool:
+    return (
+        is_screenshot_parser_node(node)
+        and node.kind in {"container", "background"}
+        and not is_visual_detail_target_node(node)
+    )
+
+
+def has_external_node_link(links: list[tuple[UINode, float]]) -> bool:
+    return any(not is_screenshot_parser_node(node) for node, _ in links)
+
+
+def linked_nodes_for_region(
+    region: Region,
+    nodes: list[UINode],
+    min_overlap: float = 0.08,
+) -> list[tuple[UINode, float]]:
+    candidate_box = region_box(region)
+    linked: list[tuple[UINode, float]] = []
+    for node in nodes:
+        if node.kind == "screen":
+            continue
+        score = box_overlap_score(candidate_box, node_box(node))
+        if score >= min_overlap:
+            linked.append((node, score))
+    linked.sort(
+        key=lambda item: (
+            not is_visual_detail_target_node(item[0]),
+            -item[1],
+            item[0].bbox_area,
+            item[0].node_id,
+        )
+    )
+    return linked[:8]
+
+
+def linked_implementation_evidence_for_region(
+    region: Region,
+    implementation_evidence: list[ImplementationEvidence],
+    linked_node_ids: set[str],
+    min_overlap: float = 0.08,
+) -> list[tuple[ImplementationEvidence, float]]:
+    candidate_box = region_box(region)
+    candidate_ids = candidate_id_values(region)
+    linked: list[tuple[ImplementationEvidence, float]] = []
+    for evidence in implementation_evidence:
+        score = 0.0
+        if evidence.candidate_id and evidence.candidate_id in candidate_ids:
+            score = 1.0
+        elif evidence.target_node_id and evidence.target_node_id in linked_node_ids:
+            score = 0.95
+        elif evidence.bbox is not None:
+            score = box_overlap_score(candidate_box, evidence.bbox)
+        if score >= min_overlap:
+            linked.append((evidence, score))
+    linked.sort(key=lambda item: (-item[1], item[0].evidence_id))
+    return linked[:8]
+
+
+def node_link_payload(node: UINode, score: float) -> dict[str, object]:
+    payload = node_payload(node)
+    payload["overlap_score"] = round(score, 4)
+    return payload
+
+
+def evidence_link_payload(evidence: ImplementationEvidence, score: float) -> dict[str, object]:
+    payload = implementation_evidence_payload(evidence)
+    payload["overlap_score"] = round(score, 4)
+    return payload
+
+
+def best_target_node(
+    expected_links: list[tuple[UINode, float]],
+    actual_links: list[tuple[UINode, float]],
+) -> UINode | None:
+    combined = [
+        item
+        for item in [*expected_links, *actual_links]
+        if not is_broad_screenshot_parser_node(item[0])
+    ]
+    if not combined:
+        return None
+    combined.sort(
+        key=lambda item: (
+            not is_visual_detail_target_node(item[0]),
+            -item[1],
+            item[0].bbox_area,
+            item[0].node_id,
+        )
+    )
+    return combined[0][0]
+
+
+def match_for_target_node(
+    target_node: UINode | None,
+    node_matches: list[NodeMatch],
+) -> NodeMatch | None:
+    if target_node is None:
+        return None
+    for match in node_matches:
+        if match.expected_node and match.expected_node.node_id == target_node.node_id:
+            return match
+        if match.actual_node and match.actual_node.node_id == target_node.node_id:
+            return match
+    return None
 
 
 def bbox_distance(a: UINode, b: UINode, image_size: tuple[int, int]) -> float:
@@ -2578,6 +2984,292 @@ def deferred_background_issues_from_pixels(
     return deferred[:1]
 
 
+def issue_box_tuple(payload: dict[str, int] | None) -> tuple[int, int, int, int] | None:
+    if payload is None:
+        return None
+    return (
+        int(payload["x"]),
+        int(payload["y"]),
+        int(payload["width"]),
+        int(payload["height"]),
+    )
+
+
+def issue_overlaps_any_visual_candidate(issue: UIIssue, candidates: list[Region]) -> bool:
+    issue_boxes = [
+        issue_box_tuple(issue.expected_box),
+        issue_box_tuple(issue.actual_box),
+    ]
+    for box in issue_boxes:
+        if box is None:
+            continue
+        if any(box_overlap_score(box, region_box(candidate)) >= 0.08 for candidate in candidates):
+            return True
+    return False
+
+
+def visual_issue_text(
+    region: Region,
+    target_name: str,
+    resolution_status: str,
+    static_agreement: bool,
+) -> tuple[str, str]:
+    if static_agreement:
+        return (
+            f"{target_name} has a visible screenshot mismatch, while static implementation evidence agrees with the design.",
+            "Keep the visual issue; inspect rendered asset size, mask, stroke, shadow, scale, anti-aliasing, layout proposal, or clipping rather than trusting constants alone.",
+        )
+    if resolution_status == "resolved_to_detail_node":
+        return (
+            f"{target_name} is the nearest detail node explaining visual candidate V-{region.region_id:03d}.",
+            "Fix the local rendered node: size, position, crop, glyph metrics, icon asset, stroke, padding, or alignment.",
+        )
+    if resolution_status == "screenshot_parser_detail_candidate":
+        return (
+            f"{target_name} is the screenshot-parser detail candidate explaining visual candidate V-{region.region_id:03d}.",
+            "Keep the screenshot-backed issue, then use Figma/get_design_context, Chrome DevTools, or source search to confirm the owning implementation node.",
+        )
+    if resolution_status == "resolved_to_container_or_metadata":
+        return (
+            f"{target_name} is the nearest available node/evidence for visual candidate V-{region.region_id:03d}, but no leaf detail node was confirmed.",
+            "Use Figma/get_design_context, Chrome DevTools, or code search to inspect child nodes before applying a broad parent fix.",
+        )
+    return (
+        f"Visual candidate V-{region.region_id:03d} is screenshot-backed but has no external node/code evidence attached.",
+        "Use Figma/get_design_context, Chrome DevTools, or source search around this crop to locate the exact owning element.",
+    )
+
+
+def visual_issue_confidence(
+    region: Region,
+    resolution_status: str,
+    linked_implementation: list[tuple[ImplementationEvidence, float]],
+) -> float:
+    confidence = region.confidence_score or 0.5
+    if resolution_status == "resolved_to_detail_node":
+        confidence += 0.14
+    elif resolution_status == "screenshot_parser_detail_candidate":
+        confidence += 0.08
+    elif resolution_status == "resolved_to_container_or_metadata":
+        confidence += 0.07
+    if linked_implementation:
+        confidence += min(0.08, max(score for _, score in linked_implementation) * 0.08)
+    return round(max(0.1, min(0.98, confidence)), 3)
+
+
+def build_visual_issue(
+    region: Region,
+    issue_index: int,
+    mask: np.ndarray,
+    expected_links: list[tuple[UINode, float]],
+    actual_links: list[tuple[UINode, float]],
+    implementation_links: list[tuple[ImplementationEvidence, float]],
+    node_matches: list[NodeMatch],
+) -> tuple[UIIssue, dict[str, object] | None]:
+    target_node = best_target_node(expected_links, actual_links)
+    target_match = match_for_target_node(target_node, node_matches)
+    target_name = target_node.name if target_node else f"Visual candidate V-{region.region_id:03d}"
+    target_id = target_node.node_id if target_node else f"visual-candidate-{region.region_id}"
+    target_kind = target_node.kind if target_node else region.element_kind
+    detail_resolved = target_node is not None and is_visual_detail_target_node(target_node)
+    target_has_external_node = target_node is not None and not is_screenshot_parser_node(target_node)
+    has_external_evidence = (
+        has_external_node_link(expected_links)
+        or has_external_node_link(actual_links)
+        or bool(implementation_links)
+    )
+    static_agreement = any(
+        bool(evidence.properties.get("static_agreement"))
+        for evidence, _ in implementation_links
+    )
+
+    if static_agreement:
+        resolution_status = "rendered visual mismatch with static implementation agreement"
+    elif detail_resolved and target_has_external_node:
+        resolution_status = "resolved_to_detail_node"
+    elif detail_resolved:
+        resolution_status = "screenshot_parser_detail_candidate"
+    elif has_external_evidence:
+        resolution_status = "resolved_to_container_or_metadata"
+    else:
+        resolution_status = "visual_only_unresolved"
+
+    expected_box = None
+    actual_box = None
+    delta: dict[str, int | float | None] = {"dx": None, "dy": None, "dw": None, "dh": None}
+    parent_delta: dict[str, int | float | None] = {"dx": 0, "dy": 0, "dw": 0, "dh": 0}
+    residual_delta: dict[str, int | float | None] = {"dx": None, "dy": None, "dw": None, "dh": None}
+    if target_match is not None:
+        expected_box_tuple = node_box(target_match.expected_node)
+        actual_box_tuple = effective_actual_box_for_match(target_match)
+        expected_box = box_payload(expected_box_tuple)
+        actual_box = box_payload(actual_box_tuple)
+        delta = target_match.delta or center_delta(expected_box_tuple, actual_box_tuple)
+        parent_delta = target_match.parent_delta or {"dx": 0, "dy": 0, "dw": 0, "dh": 0}
+        residual_delta = target_match.residual_delta or delta
+    elif target_node is not None:
+        if any(node.node_id == target_node.node_id for node, _ in expected_links):
+            expected_box = box_payload(node_box(target_node))
+            actual_box = box_payload(region_box(region))
+        else:
+            expected_box = box_payload(region_box(region))
+            actual_box = box_payload(node_box(target_node))
+    else:
+        expected_box = box_payload(region_box(region))
+        actual_box = box_payload(region_box(region))
+
+    category = region.priority_category
+    priority_tier = region.priority_tier
+    if target_node is not None and all(value is not None for value in delta.values()):
+        node_category = issue_category_for_node(
+            target_node,
+            {key: int(value or 0) for key, value in delta.items()},
+            {key: int(value or 0) for key, value in residual_delta.items()},
+        )
+        if node_category is not None and category_tier(node_category) < priority_tier:
+            category = node_category
+            priority_tier = category_tier(node_category)
+
+    diff_count, diff_bbox = diff_pixel_evidence(region, mask)
+    diagnosis, suggested_fix = visual_issue_text(region, target_name, resolution_status, static_agreement)
+    issue = UIIssue(
+        issue_id=f"I-{issue_index:03d}",
+        issue_type="visual_diff",
+        category=category,
+        priority_tier=priority_tier,
+        target_node_id=target_id,
+        target_name=target_name,
+        node_kind=target_kind,
+        expected_box=expected_box,
+        actual_box=actual_box,
+        delta=delta,
+        parent_delta=parent_delta,
+        residual_delta=residual_delta,
+        severity_score=region.severity_score,
+        confidence_score=visual_issue_confidence(region, resolution_status, implementation_links),
+        diagnosis=diagnosis,
+        suggested_fix=suggested_fix,
+        evidence={
+            "visual_candidate": candidate_simple_payload(region, mask),
+            "linked_expected_nodes": [node_link_payload(node, score) for node, score in expected_links],
+            "linked_actual_nodes": [node_link_payload(node, score) for node, score in actual_links],
+            "linked_implementation_evidence": [
+                evidence_link_payload(evidence, score)
+                for evidence, score in implementation_links
+            ],
+            "node_match_id": target_match.match_id if target_match else None,
+            "node_actual_box": box_payload(node_box(target_match.actual_node)) if target_match else None,
+            "node_expected_box": box_payload(node_box(target_match.expected_node)) if target_match else None,
+            "evidence_resolution": resolution_status,
+            "screenshot_is_ground_truth": True,
+            "static_evidence_cannot_suppress": static_agreement,
+            "pixel_diff_is_evidence_only": False,
+            "diff_pixel_count": diff_count,
+            "diff_pixel_bbox": diff_bbox,
+        },
+        deferred=priority_tier >= 7,
+        source_method="visual-first",
+    )
+
+    unresolved = None
+    if resolution_status in {
+        "visual_only_unresolved",
+        "resolved_to_container_or_metadata",
+        "screenshot_parser_detail_candidate",
+    }:
+        unresolved = {
+            **candidate_simple_payload(region, mask),
+            "reason": (
+                "no external node/code evidence attached"
+                if resolution_status == "visual_only_unresolved"
+                else "screenshot-parser detail only; no external node/code evidence attached"
+                if resolution_status == "screenshot_parser_detail_candidate"
+                else "only broad container or metadata evidence attached; no leaf detail node confirmed"
+            ),
+            "resolution_status": resolution_status,
+            "linked_expected_node_ids": [node.node_id for node, _ in expected_links],
+            "linked_actual_node_ids": [node.node_id for node, _ in actual_links],
+        }
+    return issue, unresolved
+
+
+def metadata_only_from_issue(issue: UIIssue) -> dict[str, object]:
+    payload = issue_payload(issue)
+    payload["metadata_only"] = True
+    payload["reason"] = "node/code evidence has no visible screenshot candidate overlap"
+    return payload
+
+
+def resolve_visual_issues(
+    visual_candidates: list[Region],
+    mask: np.ndarray,
+    expected_nodes: list[UINode],
+    actual_nodes: list[UINode],
+    node_matches: list[NodeMatch],
+    node_metadata_issues: list[UIIssue],
+    implementation_evidence: list[ImplementationEvidence],
+) -> tuple[list[UIIssue], list[UIIssue], list[UIIssue], list[dict[str, object]], list[dict[str, object]]]:
+    issues: list[UIIssue] = []
+    actionable: list[UIIssue] = []
+    deferred: list[UIIssue] = []
+    unresolved_visual_candidates: list[dict[str, object]] = []
+    metadata_only_findings: list[dict[str, object]] = []
+    linked_evidence_ids: set[str] = set()
+
+    for issue_index, region in enumerate(visual_candidates, start=1):
+        expected_links = linked_nodes_for_region(region, expected_nodes)
+        actual_links = linked_nodes_for_region(region, actual_nodes)
+        linked_node_ids = {
+            node.node_id
+            for node, _ in [*expected_links, *actual_links]
+        }
+        implementation_links = linked_implementation_evidence_for_region(
+            region,
+            implementation_evidence,
+            linked_node_ids,
+        )
+        linked_evidence_ids.update(evidence.evidence_id for evidence, _ in implementation_links)
+        issue, unresolved = build_visual_issue(
+            region,
+            issue_index,
+            mask,
+            expected_links,
+            actual_links,
+            implementation_links,
+            node_matches,
+        )
+        issues.append(issue)
+        if issue.deferred:
+            deferred.append(issue)
+        else:
+            actionable.append(issue)
+        if unresolved is not None:
+            unresolved_visual_candidates.append(unresolved)
+
+    for metadata_issue in node_metadata_issues:
+        if issue_overlaps_any_visual_candidate(metadata_issue, visual_candidates):
+            continue
+        metadata_only_findings.append(metadata_only_from_issue(metadata_issue))
+
+    for evidence in implementation_evidence:
+        if evidence.evidence_id in linked_evidence_ids:
+            continue
+        metadata_only_findings.append(
+            {
+                "metadata_only": True,
+                "reason": "implementation evidence has no visible screenshot candidate overlap",
+                "implementation_evidence": implementation_evidence_payload(evidence),
+            }
+        )
+
+    actionable.sort(key=lambda issue: (issue.priority_tier, -issue.severity_score, issue.target_name))
+    deferred.sort(key=lambda issue: (issue.priority_tier, -issue.severity_score, issue.target_name))
+    issues = [*actionable, *deferred]
+    for report_id, issue in enumerate(issues, start=1):
+        issue.report_id = report_id
+    return issues, actionable, deferred, unresolved_visual_candidates, metadata_only_findings
+
+
 def issue_payload(issue: UIIssue) -> dict[str, object]:
     return {
         "issue_id": issue.issue_id,
@@ -2655,13 +3347,24 @@ def hierarchy_policy_text(
     hierarchy_depth: int | None,
     report_mode: str | None,
     effective_depth: int | None,
+    node_mode: str = "auto",
 ) -> str:
     if effective_depth is None:
+        if node_mode != "pixel":
+            return (
+                "Compatibility marker regions stay top-down, while visual_candidates "
+                "also retain eligible raw detail regions that were suppressed by a parent marker."
+            )
         return (
             "Report page, edge, and parent-module differences before child elements. "
             "Suppress child regions when a parent layout/spacing/background/edge issue explains them."
         )
     source = f"report-mode {report_mode!r}" if hierarchy_depth is None and report_mode else "hierarchy-depth"
+    if node_mode != "pixel":
+        return (
+            f"Report markers use hierarchy-depth {effective_depth} from {source} for compatibility. "
+            "visual_candidates remain screenshot-first and keep eligible child detail regions for evidence resolution."
+        )
     return (
         f"Report regions up to hierarchy-depth {effective_depth} from {source} in top-down order. "
         "Parent regions stay visible for context but do not hide eligible child detail regions."
@@ -2722,6 +3425,11 @@ def save_regions(
     actionable_issues: list[UIIssue] | None = None,
     deferred_visual_issues: list[UIIssue] | None = None,
     raw_pixel_regions: list[Region] | None = None,
+    visual_candidates: list[Region] | None = None,
+    resolved_issues: list[UIIssue] | None = None,
+    unresolved_visual_candidates: list[dict[str, object]] | None = None,
+    metadata_only_findings: list[dict[str, object]] | None = None,
+    implementation_evidence: list[ImplementationEvidence] | None = None,
 ) -> None:
     artifacts = {
         "annotated_actual": str(out_dir / "annotated_actual.png"),
@@ -2825,7 +3533,7 @@ def save_regions(
             "rasterization-only noise",
         ],
         "diff_engine": {
-            "mode": "node-first" if node_mode != "pixel" else "multi-signal",
+            "mode": "visual-first" if node_mode != "pixel" else "multi-signal",
             "signals": [
                 "rgb pixel distance",
                 "CIE Lab perceptual color distance",
@@ -2833,8 +3541,9 @@ def save_regions(
                 "Sobel edge/stroke delta",
             ],
             "decision_policy": (
-                "UI node matching and hierarchical attribution produce primary issues; "
-                "pixel diff channels are evidence/debug inputs."
+                "Screenshot diff produces primary visual candidates; Figma, runtime, and "
+                "implementation metadata resolve targets and root-cause hints but cannot "
+                "suppress visible screenshot mismatches."
                 if node_mode != "pixel"
                 else "Legacy pixel-region hierarchy produces primary regions."
             ),
@@ -2855,7 +3564,7 @@ def save_regions(
                 "Geometry and relationship issues outrank color and decorative effects."
             ),
         },
-        "hierarchy_policy": hierarchy_policy_text(hierarchy_depth, report_mode, effective_depth),
+        "hierarchy_policy": hierarchy_policy_text(hierarchy_depth, report_mode, effective_depth, node_mode),
         "normalization_policy": (
             "The actual screenshot is the coordinate baseline. If the design image size differs, "
             "the expected design is proportionally fit into the actual screenshot canvas without "
@@ -2876,6 +3585,10 @@ def save_regions(
             "node_mode": node_mode,
             "signal_thresholds": signals.thresholds,
         },
+        "visual_candidates": [
+            region_payload(region)
+            for region in (visual_candidates or [])
+        ],
         "ui_nodes": {
             "expected": [node_payload(node) for node in (expected_nodes or [])],
             "actual": [node_payload(node) for node in (actual_nodes or [])],
@@ -2896,10 +3609,17 @@ def save_regions(
                 "kinds": sorted(NODE_KINDS),
             },
         },
+        "implementation_evidence": [
+            implementation_evidence_payload(evidence)
+            for evidence in (implementation_evidence or [])
+        ],
         "node_matches": [match_payload(match) for match in (node_matches or [])],
         "issues": [issue_payload(issue) for issue in (issues or [])],
+        "resolved_issues": [issue_payload(issue) for issue in (resolved_issues or issues or [])],
         "actionable_issues": [issue_payload(issue) for issue in (actionable_issues or [])],
         "deferred_visual_issues": [issue_payload(issue) for issue in (deferred_visual_issues or [])],
+        "unresolved_visual_candidates": unresolved_visual_candidates or [],
+        "metadata_only_findings": metadata_only_findings or [],
         "regions": [region_payload(region) for region in regions],
         "reported_regions": [region_payload(region) for region in reported_regions],
         "suppressed_regions": [region_payload(region) for region in suppressed_regions],
@@ -2935,6 +3655,11 @@ def main() -> int:
     expected_path = Path(args.expected).expanduser().resolve()
     expected_nodes_path = Path(args.expected_nodes).expanduser().resolve() if args.expected_nodes else None
     actual_nodes_path = Path(args.actual_nodes).expanduser().resolve() if args.actual_nodes else None
+    implementation_evidence_path = (
+        Path(args.implementation_evidence).expanduser().resolve()
+        if args.implementation_evidence
+        else None
+    )
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2972,6 +3697,10 @@ def main() -> int:
     actionable_issues: list[UIIssue] = []
     deferred_visual_issues: list[UIIssue] = []
     issues: list[UIIssue] = []
+    visual_candidates: list[Region] = []
+    unresolved_visual_candidates: list[dict[str, object]] = []
+    metadata_only_findings: list[dict[str, object]] = []
+    implementation_evidence: list[ImplementationEvidence] = []
 
     if args.node_mode != "pixel":
         expected_nodes = load_ui_nodes(
@@ -3001,22 +3730,39 @@ def main() -> int:
             actual_array,
             actual_image.size,
         )
-        actionable_issues, deferred_visual_issues = diagnose_node_issues(
-            node_matches,
-            signals,
+        implementation_evidence = load_implementation_evidence(
+            implementation_evidence_path,
             actual_image.size,
         )
-        deferred_visual_issues.extend(
-            deferred_background_issues_from_pixels(
-                raw_pixel_regions,
+        node_metadata_issues: list[UIIssue] = []
+        if expected_nodes_path or actual_nodes_path:
+            node_actionable, node_deferred = diagnose_node_issues(
+                node_matches,
                 signals,
                 actual_image.size,
-                start_index=len(actionable_issues) + len(deferred_visual_issues) + 1,
             )
+            node_metadata_issues = [*node_actionable, *node_deferred]
+        visual_candidates = visual_candidate_pool(
+            raw_pixel_regions,
+            pixel_reported_regions,
+            actual_image.size,
+            args.max_regions,
         )
-        for report_id, issue in enumerate([*actionable_issues, *deferred_visual_issues], start=1):
-            issue.report_id = report_id
-        issues = [*actionable_issues, *deferred_visual_issues]
+        (
+            issues,
+            actionable_issues,
+            deferred_visual_issues,
+            unresolved_visual_candidates,
+            metadata_only_findings,
+        ) = resolve_visual_issues(
+            visual_candidates,
+            mask,
+            expected_nodes,
+            actual_nodes,
+            node_matches,
+            node_metadata_issues,
+            implementation_evidence,
+        )
 
     if args.node_mode == "pixel" or (args.node_mode == "auto" and not issues and len(expected_nodes) <= 1 and len(actual_nodes) <= 1):
         regions = raw_pixel_regions
@@ -3027,7 +3773,7 @@ def main() -> int:
         marker_issues = (actionable_issues if actionable_issues else deferred_visual_issues)[: args.max_regions]
         regions = [issue_to_region(issue, index) for index, issue in enumerate(marker_issues, start=1)]
         reported_regions = regions
-        suppressed_regions = []
+        suppressed_regions = pixel_suppressed_regions
         active_node_mode = args.node_mode
 
     evidence_mask = evidence_mask_for_regions(mask, reported_regions)
@@ -3095,6 +3841,11 @@ def main() -> int:
         actionable_issues=actionable_issues,
         deferred_visual_issues=deferred_visual_issues,
         raw_pixel_regions=raw_pixel_regions,
+        visual_candidates=visual_candidates,
+        resolved_issues=issues,
+        unresolved_visual_candidates=unresolved_visual_candidates,
+        metadata_only_findings=metadata_only_findings,
+        implementation_evidence=implementation_evidence,
     )
 
     print(
