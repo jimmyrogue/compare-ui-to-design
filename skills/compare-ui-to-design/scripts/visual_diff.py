@@ -22,6 +22,8 @@ REPORT_MODE_DEPTHS = {
     "raw": 9,
 }
 
+Component = tuple[int, int, int, int, int, list[tuple[int, int]]]
+
 
 @dataclass
 class Region:
@@ -383,10 +385,10 @@ def denoise_mask(mask: np.ndarray) -> np.ndarray:
     return mask & (neighbor_count >= 2)
 
 
-def connected_components(mask: np.ndarray, min_area: int) -> list[tuple[int, int, int, int, int, list[tuple[int, int]]]]:
+def connected_components(mask: np.ndarray, min_area: int) -> list[Component]:
     height, width = mask.shape
     visited = np.zeros_like(mask, dtype=bool)
-    components: list[tuple[int, int, int, int, int, list[tuple[int, int]]]] = []
+    components: list[Component] = []
 
     for start_y in range(height):
         for start_x in range(width):
@@ -433,10 +435,10 @@ def boxes_touch_or_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int,
 
 
 def merge_components(
-    components: list[tuple[int, int, int, int, int, list[tuple[int, int]]]],
+    components: list[Component],
     merge_gap: int,
-) -> list[tuple[int, int, int, int, int, list[tuple[int, int]]]]:
-    merged: list[tuple[int, int, int, int, int, list[tuple[int, int]]]] = []
+) -> list[Component]:
+    merged: list[Component] = []
 
     for component in components:
         cx1, cy1, cx2, cy2, area, pixels = component
@@ -447,7 +449,7 @@ def merge_components(
         changed = True
         while changed:
             changed = False
-            next_merged: list[tuple[int, int, int, int, int, list[tuple[int, int]]]] = []
+            next_merged: list[Component] = []
             for existing in merged:
                 ex1, ey1, ex2, ey2, existing_area, existing_pixels = existing
                 existing_box = (ex1, ey1, ex2, ey2)
@@ -471,15 +473,113 @@ def merge_components(
 
 
 def dedupe_components(
-    components: Iterable[tuple[int, int, int, int, int, list[tuple[int, int]]]],
-) -> list[tuple[int, int, int, int, int, list[tuple[int, int]]]]:
-    deduped: dict[tuple[int, int, int, int], tuple[int, int, int, int, int, list[tuple[int, int]]]] = {}
+    components: Iterable[Component],
+) -> list[Component]:
+    deduped: dict[tuple[int, int, int, int], Component] = {}
     for component in components:
         x1, y1, x2, y2, area, _ = component
         key = (x1, y1, x2, y2)
         if key not in deduped or area > deduped[key][4]:
             deduped[key] = component
     return list(deduped.values())
+
+
+def component_bbox_area(component: Component) -> int:
+    x1, y1, x2, y2, _, _ = component
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def component_overlap_ratio(a: Component, b: Component) -> float:
+    ax1, ay1, ax2, ay2, _, _ = a
+    bx1, by1, bx2, by2, _, _ = b
+    overlap = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
+    return overlap / max(1, min(component_bbox_area(a), component_bbox_area(b)))
+
+
+def is_object_detail_component(
+    component: Component,
+    image_size: tuple[int, int],
+    min_area: int,
+) -> bool:
+    image_width, image_height = image_size
+    image_area = image_width * image_height
+    x1, y1, x2, y2, area, _ = component
+    width = x2 - x1
+    height = y2 - y1
+    if width < 4 or height < 4 or area < max(min_area, 12):
+        return False
+
+    bbox_area = max(1, width * height)
+    bbox_ratio = bbox_area / max(1, image_area)
+    width_ratio = width / max(1, image_width)
+    height_ratio = height / max(1, image_height)
+    fill_ratio = area / bbox_area
+    aspect = width / max(1, height)
+    min_dimension = max(1, min(image_width, image_height))
+    max_allowed_dimension = max(128, round(min_dimension * 0.28))
+
+    if bbox_ratio > 0.08 or width_ratio > 0.34 or height_ratio > 0.32:
+        return False
+    if max(width, height) > max_allowed_dimension:
+        return False
+    if aspect > 5.5 or aspect < 0.18:
+        return False
+    if fill_ratio < 0.035:
+        return False
+    if width <= 3 or height <= 3:
+        return False
+    return True
+
+
+def dedupe_detail_components(components: Iterable[Component]) -> list[Component]:
+    ordered = sorted(
+        dedupe_components(components),
+        key=lambda component: (component[4], component_bbox_area(component)),
+        reverse=True,
+    )
+    selected: list[Component] = []
+    for component in ordered:
+        if any(component_overlap_ratio(component, existing) >= 0.84 for existing in selected):
+            continue
+        selected.append(component)
+    return selected
+
+
+def detail_proposal_components(
+    signals: DiffSignals,
+    min_area: int,
+    image_size: tuple[int, int],
+) -> list[Component]:
+    """Split object-like detail candidates out of broad color/layout regions."""
+    rgb_threshold = max(signals.thresholds["rgb"] * 3.0, 36.0)
+    color_threshold = max(signals.thresholds["color_delta_e"] * 3.0, 8.0)
+    structure_threshold = max(signals.thresholds["structure_dissimilarity"] * 2.5, 0.12)
+    edge_threshold = max(signals.thresholds["edge_delta"] * 2.75, 50.0)
+
+    strong_rgb = signals.rgb_delta >= rgb_threshold
+    strong_color = signals.color_delta >= color_threshold
+    strong_structure = signals.structure_mask & (signals.structure_delta >= structure_threshold)
+    strong_edge = signals.edge_delta >= edge_threshold
+
+    masks = [
+        denoise_mask(signals.edge_mask),
+        denoise_mask(signals.edge_mask & strong_edge),
+        denoise_mask(strong_rgb | strong_color),
+        denoise_mask(strong_structure),
+        denoise_mask(strong_rgb | strong_color | (signals.edge_mask & strong_edge) | strong_structure),
+    ]
+
+    detail_components: list[Component] = []
+    detail_min_area = max(8, min_area)
+    for detail_mask in masks:
+        components = connected_components(detail_mask, detail_min_area)
+        detail_components.extend(
+            component
+            for component in components
+            if is_object_detail_component(component, image_size, detail_min_area)
+        )
+
+    return dedupe_detail_components(detail_components)
 
 
 def category_hint(width: int, height: int, area: int, mean_delta: float) -> str:
@@ -547,12 +647,14 @@ def infer_element_kind(region: Region, image_size: tuple[int, int]) -> str:
     image_area = image_width * image_height
     bbox_ratio = region.bbox_area / max(1, image_area)
     fill_ratio = region.area / max(1, region.bbox_area)
+    aspect = region.width / max(1, region.height)
     hint = region.category_hint.lower()
     edge = touches_screen_edge(region, image_size)
     color_count = region.signal_counts.get("color", 0)
     structure_count = region.signal_counts.get("structure", 0)
     edge_count = region.signal_counts.get("edge", 0)
     rgb_count = region.signal_counts.get("rgb", 0)
+    object_detail_max_dimension = max(128, round(min(image_width, image_height) * 0.28))
 
     if edge and (
         region.width / max(1, image_width) >= 0.24
@@ -576,6 +678,16 @@ def infer_element_kind(region: Region, image_size: tuple[int, int]) -> str:
     if "typography/icon" in hint and max(region.width, region.height) <= max(
         96,
         round(min(image_width, image_height) * 0.24),
+    ):
+        return "icon/image detail"
+    if (
+        bbox_ratio < 0.08
+        and max(region.width, region.height) <= object_detail_max_dimension
+        and 0.18 <= aspect <= 5.5
+        and fill_ratio >= 0.035
+        and (edge_count > 0 or structure_count > 0)
+        and not is_thin_horizontal(region)
+        and not is_thin_vertical(region)
     ):
         return "icon/image detail"
     if is_thin_horizontal(region) or is_thin_vertical(region):
@@ -604,6 +716,10 @@ def priority_category_for_region(region: Region, image_size: tuple[int, int]) ->
 
     if color_only and region.element_kind in {"screen-edge/safe-area", "background/color fill", "module/container"}:
         return "background color", 7
+    if region.element_kind == "icon/image detail":
+        return "image / icon consistency", 4
+    if region.element_kind in {"typography/text metrics", "typography/icon stroke"}:
+        return "font metrics / typography", 5
     if "module layout/spacing group" in hint:
         return "relative relationship / spacing", 3
     if "layout" in hint or region.element_kind == "module/container":
@@ -614,10 +730,6 @@ def priority_category_for_region(region: Region, image_size: tuple[int, int]) ->
         return "position / alignment", 2
     if region.element_kind == "screen-edge/safe-area":
         return "background color", 7
-    if region.element_kind == "icon/image detail":
-        return "image / icon consistency", 4
-    if region.element_kind in {"typography/text metrics", "typography/icon stroke"}:
-        return "font metrics / typography", 5
     if "border" in hint or "divider" in hint:
         return "position / alignment", 2
     if color_only and region.element_kind != "background/color fill" and fill_ratio < 0.45:
@@ -731,7 +843,7 @@ def score_region_importance(region: Region, image_size: tuple[int, int], base_pr
 
 
 def make_regions(
-    components: Iterable[tuple[int, int, int, int, int, list[tuple[int, int]]]],
+    components: Iterable[Component],
     signals: DiffSignals,
     max_regions: int,
 ) -> list[Region]:
@@ -1394,6 +1506,21 @@ def effective_hierarchy_depth(
     return None
 
 
+def focus_regions_for_depth(
+    reported_regions: list[Region],
+    effective_depth: int | None,
+) -> list[Region]:
+    if effective_depth is None or effective_depth <= 3:
+        return reported_regions
+
+    focus_regions = [
+        region
+        for region in reported_regions
+        if 4 <= region.display_depth <= effective_depth
+    ]
+    return focus_regions or reported_regions
+
+
 def save_regions(
     out_dir: Path,
     actual_path: Path,
@@ -1565,6 +1692,10 @@ def save_regions(
             for region in reported_regions
             if effective_depth is not None
         ],
+        "focus_regions": [
+            region_payload(region)
+            for region in focus_regions_for_depth(reported_regions, effective_depth)
+        ],
         "parent_regions": [
             region_payload(region)
             for region in reported_regions
@@ -1602,10 +1733,12 @@ def main() -> int:
     components = connected_components(mask, args.min_area)
     priority_mask = denoise_mask(signals.structure_mask | signals.edge_mask)
     priority_components = connected_components(priority_mask, args.min_area)
+    detail_components = detail_proposal_components(signals, args.min_area, actual_image.size)
     merged = dedupe_components(
         [
             *merge_components(components, args.merge_gap),
             *merge_components(priority_components, args.merge_gap),
+            *detail_components,
         ]
     )
     regions = make_regions(merged, signals, args.max_regions)
@@ -1628,8 +1761,9 @@ def main() -> int:
     annotated_expected = draw_annotations(expected_image, reported_regions)
     annotated_raw = draw_annotations(actual_image, regions)
     annotated_raw_expected = draw_annotations(expected_image, regions)
-    annotated_depth = draw_annotations(actual_image, reported_regions)
-    annotated_depth_expected = draw_annotations(expected_image, reported_regions)
+    focus_regions = focus_regions_for_depth(reported_regions, effective_depth)
+    annotated_depth = draw_annotations(actual_image, focus_regions)
+    annotated_depth_expected = draw_annotations(expected_image, focus_regions)
     evidence_overlay_actual = draw_evidence_overlay(actual_image, evidence_mask, reported_regions)
     evidence_overlay_expected = draw_evidence_overlay(expected_image, evidence_mask, reported_regions)
     heatmap = draw_heatmap(delta)

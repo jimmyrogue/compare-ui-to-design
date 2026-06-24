@@ -584,6 +584,70 @@ def test_report_mode_detail_selects_depth_five(tmp_path):
     )
 
 
+def test_detail_mode_splits_internal_objects_from_broad_parent_regions(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, color=(250, 250, 250), size=(560, 360))
+    actual = save_image(actual_path, color=(250, 250, 250), size=(560, 360))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((60, 40, 520, 190), fill=(236, 247, 240), outline=(225, 235, 228), width=2)
+    actual_draw.rectangle((60, 40, 520, 190), fill=(240, 250, 243), outline=(225, 235, 228), width=2)
+
+    expected_draw.polygon(
+        [(388, 58), (430, 78), (438, 128), (405, 168), (352, 146), (344, 92)],
+        fill=(204, 235, 190),
+        outline=(122, 150, 108),
+    )
+    expected_draw.ellipse((362, 82, 432, 152), outline=(84, 185, 132), width=7)
+    expected_draw.line((382, 152, 420, 82), fill=(84, 185, 132), width=9)
+
+    actual_draw.polygon(
+        [(370, 54), (424, 76), (436, 136), (396, 174), (338, 148), (330, 86)],
+        fill=(204, 235, 190),
+        outline=(122, 150, 108),
+    )
+    actual_draw.ellipse((346, 82, 430, 164), outline=(84, 185, 132), width=7)
+    actual_draw.line((370, 160, 416, 78), fill=(84, 185, 132), width=9)
+
+    expected_draw.rectangle((70, 230, 510, 304), fill=(236, 247, 240), outline=(225, 235, 228), width=2)
+    actual_draw.rectangle((70, 230, 510, 304), fill=(240, 250, 243), outline=(225, 235, 228), width=2)
+    expected_draw.ellipse((438, 246, 482, 290), outline=(38, 210, 120), width=6)
+    expected_draw.ellipse((451, 259, 469, 277), fill=(245, 255, 248))
+    actual_draw.ellipse((430, 242, 486, 298), outline=(38, 210, 120), width=6)
+    actual_draw.ellipse((446, 258, 470, 282), fill=(245, 255, 248))
+
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail", "--min-area", "8")
+    reported = payload["reported_regions"]
+
+    assert any(
+        region["display_depth"] == 5
+        and region["priority_tier"] == 4
+        and region["priority_category"] == "image / icon consistency"
+        and 320 <= region["x"] <= 410
+        and 45 <= region["y"] <= 95
+        and region["width"] <= 150
+        and region["height"] <= 140
+        for region in reported
+    )
+    assert any(
+        region["display_depth"] == 5
+        and region["priority_tier"] == 4
+        and 420 <= region["x"] <= 450
+        and 235 <= region["y"] <= 255
+        and region["width"] <= 80
+        and region["height"] <= 80
+        for region in reported
+    )
+    assert payload["focus_regions"]
+    assert all(4 <= region["display_depth"] <= 5 for region in payload["focus_regions"])
+
+
 def test_hierarchy_depth_overrides_report_mode_preset(tmp_path):
     expected_path = tmp_path / "expected.png"
     actual_path = tmp_path / "actual.png"
@@ -629,6 +693,11 @@ def test_depth_mode_exposes_structured_region_buckets(tmp_path):
 
     assert [region["id"] for region in payload["depth_regions"]] == [
         region["id"] for region in payload["reported_regions"]
+    ]
+    assert [region["id"] for region in payload["focus_regions"]] == [
+        region["id"]
+        for region in payload["reported_regions"]
+        if 4 <= region["display_depth"] <= 5
     ]
     assert all(region["display_depth"] <= 3 for region in payload["parent_regions"])
     assert all(4 <= region["display_depth"] <= 8 for region in payload["detail_regions"])
