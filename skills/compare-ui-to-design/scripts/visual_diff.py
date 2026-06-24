@@ -50,6 +50,8 @@ class Region:
     confidence_score: float = 0.0
     confidence_level: str = "medium"
     severity_factors: list[str] = field(default_factory=list)
+    priority_category: str = "ui visual difference"
+    priority_tier: int = 9
 
     @property
     def right(self) -> int:
@@ -468,6 +470,18 @@ def merge_components(
     return merged
 
 
+def dedupe_components(
+    components: Iterable[tuple[int, int, int, int, int, list[tuple[int, int]]]],
+) -> list[tuple[int, int, int, int, int, list[tuple[int, int]]]]:
+    deduped: dict[tuple[int, int, int, int], tuple[int, int, int, int, int, list[tuple[int, int]]]] = {}
+    for component in components:
+        x1, y1, x2, y2, area, _ = component
+        key = (x1, y1, x2, y2)
+        if key not in deduped or area > deduped[key][4]:
+            deduped[key] = component
+    return list(deduped.values())
+
+
 def category_hint(width: int, height: int, area: int, mean_delta: float) -> str:
     aspect = width / max(height, 1)
     fill_ratio = area / max(width * height, 1)
@@ -545,8 +559,6 @@ def infer_element_kind(region: Region, image_size: tuple[int, int]) -> str:
         or region.height / max(1, image_height) >= 0.16
     ):
         return "screen-edge/safe-area"
-    if is_thin_horizontal(region) or is_thin_vertical(region):
-        return "border/divider"
     if (
         color_count >= max(structure_count + edge_count, rgb_count // 2)
         and structure_count <= color_count * 0.35
@@ -554,6 +566,20 @@ def infer_element_kind(region: Region, image_size: tuple[int, int]) -> str:
         and region.area >= 240
     ):
         return "background/color fill"
+    if (
+        fill_ratio >= 0.70
+        and color_count > structure_count
+        and color_count > edge_count
+        and region.area >= 240
+    ):
+        return "background/color fill"
+    if "typography/icon" in hint and max(region.width, region.height) <= max(
+        96,
+        round(min(image_width, image_height) * 0.24),
+    ):
+        return "icon/image detail"
+    if is_thin_horizontal(region) or is_thin_vertical(region):
+        return "border/divider"
     if bbox_ratio >= 0.035 or "layout" in hint:
         return "module/container"
     if "typography" in hint and fill_ratio < 0.35:
@@ -563,6 +589,48 @@ def infer_element_kind(region: Region, image_size: tuple[int, int]) -> str:
     if fill_ratio < 0.22:
         return "typography/icon stroke"
     return "ui visual region"
+
+
+def priority_category_for_region(region: Region, image_size: tuple[int, int]) -> tuple[str, int]:
+    image_width, image_height = image_size
+    bbox_ratio = region.bbox_area / max(1, image_width * image_height)
+    fill_ratio = region.area / max(1, region.bbox_area)
+    hint = region.category_hint.lower()
+    color_count = region.signal_counts.get("color", 0)
+    structure_count = region.signal_counts.get("structure", 0)
+    edge_count = region.signal_counts.get("edge", 0)
+    non_color_count = structure_count + edge_count
+    color_only = color_count > 0 and non_color_count <= max(2, color_count * 0.20)
+
+    if color_only and region.element_kind in {"screen-edge/safe-area", "background/color fill", "module/container"}:
+        return "background color", 7
+    if "module layout/spacing group" in hint:
+        return "relative relationship / spacing", 3
+    if "layout" in hint or region.element_kind == "module/container":
+        if bbox_ratio >= 0.035 and non_color_count >= color_count * 0.25:
+            return "size / layout dimensions", 1
+        return "position / alignment", 2
+    if touches_screen_edge(region, image_size) and not color_only:
+        return "position / alignment", 2
+    if region.element_kind == "screen-edge/safe-area":
+        return "background color", 7
+    if region.element_kind == "icon/image detail":
+        return "image / icon consistency", 4
+    if region.element_kind in {"typography/text metrics", "typography/icon stroke"}:
+        return "font metrics / typography", 5
+    if "border" in hint or "divider" in hint:
+        return "position / alignment", 2
+    if color_only and region.element_kind != "background/color fill" and fill_ratio < 0.45:
+        return "foreground color", 6
+    if "gradient" in hint:
+        return "gradient", 8
+    if "shadow" in hint:
+        return "shadow / effect", 9
+    if region.element_kind == "background/color fill" or color_only:
+        return "background color", 7
+    if non_color_count > color_count:
+        return "position / alignment", 2
+    return "shadow / effect", 9
 
 
 def score_region_importance(region: Region, image_size: tuple[int, int], base_priority: float) -> None:
@@ -576,35 +644,57 @@ def score_region_importance(region: Region, image_size: tuple[int, int], base_pr
     color_strength = region.signal_strengths.get("color_delta_e", 0.0)
     edge_strength = region.signal_strengths.get("edge", 0.0)
     edge = touches_screen_edge(region, image_size)
+    priority_category, priority_tier = priority_category_for_region(region, image_size)
 
     kind_weights = {
-        "screen-edge/safe-area": 1.28,
-        "module/container": 1.18,
-        "typography/text metrics": 1.18,
+        "screen-edge/safe-area": 0.72,
+        "module/container": 1.22,
+        "typography/text metrics": 1.08,
         "icon/image detail": 1.14,
-        "border/divider": 1.1,
-        "typography/icon stroke": 1.08,
-        "background/color fill": 0.82,
+        "border/divider": 1.12,
+        "typography/icon stroke": 1.04,
+        "background/color fill": 0.54,
         "ui visual region": 1.0,
+    }
+    tier_weights = {
+        1: 1.40,
+        2: 1.28,
+        3: 1.20,
+        4: 1.12,
+        5: 1.04,
+        6: 0.78,
+        7: 0.52,
+        8: 0.42,
+        9: 0.34,
     }
     kind_weight = kind_weights.get(region.element_kind, 1.0)
     first_screen_weight = 1.12 if region.y < image_height * 0.42 else 1.0
-    multi_signal_weight = 1.0 + min(0.24, max(0, signal_count - 1) * 0.08)
-    edge_weight = 1.12 if edge else 1.0
+    multi_signal_weight = 1.0 + min(0.18, max(0, signal_count - 1) * 0.06)
+    edge_weight = 1.10 if edge and priority_tier <= 3 else 1.0
 
     visual_strength = min(1.0, region.mean_delta / 80.0)
     color_strength_norm = min(1.0, color_strength / 20.0)
     structure_strength_norm = min(1.0, structure_strength / 0.24)
     edge_strength_norm = min(1.0, edge_strength / 140.0)
-    coverage_score = min(1.0, bbox_ratio / 0.10) * 0.28 + min(1.0, changed_ratio / 0.025) * 0.28
-    detail_score = max(visual_strength, color_strength_norm, structure_strength_norm, edge_strength_norm) * 0.36
+    geometry_strength = max(structure_strength_norm, edge_strength_norm)
+    style_strength = max(visual_strength, color_strength_norm)
+    coverage_score = min(1.0, bbox_ratio / 0.10) * 0.24 + min(1.0, changed_ratio / 0.025) * 0.20
+    if priority_tier <= 5:
+        detail_score = max(geometry_strength, style_strength * 0.45) * 0.40
+    else:
+        detail_score = max(style_strength * 0.35, geometry_strength * 0.18) * 0.28
     density_score = min(1.0, density / 0.65) * 0.08
 
-    severity = (coverage_score + detail_score + density_score) * kind_weight * first_screen_weight * multi_signal_weight * edge_weight
+    severity = (
+        coverage_score
+        + detail_score
+        + density_score
+    ) * kind_weight * tier_weights[priority_tier] * first_screen_weight * multi_signal_weight * edge_weight
     severity = max(1.0, min(100.0, severity * 100.0))
 
     factors: list[str] = []
-    if edge:
+    factors.append(f"priority tier {priority_tier}: {priority_category}")
+    if edge and priority_tier <= 3:
         factors.append("screen-edge proximity")
     if signal_count >= 2:
         factors.append(f"{signal_count} diff signal channels")
@@ -634,7 +724,10 @@ def score_region_importance(region: Region, image_size: tuple[int, int], base_pr
     region.confidence_score = round(confidence, 3)
     region.confidence_level = "high" if confidence >= 0.72 else "medium" if confidence >= 0.5 else "low"
     region.severity_factors = factors
-    region.priority = round(region.severity_score * 1000.0 + base_priority * 0.02, 2)
+    region.priority_category = priority_category
+    region.priority_tier = priority_tier
+    tier_rank = (10 - priority_tier) * 1_000_000.0
+    region.priority = round(tier_rank + region.severity_score * 1000.0 + base_priority * 0.02, 2)
 
 
 def make_regions(
@@ -785,6 +878,14 @@ def display_depth_for_region(region: Region, image_size: tuple[int, int]) -> int
     hint = region.category_hint.lower()
     edge = touches_screen_edge(region, image_size)
 
+    if region.priority_tier >= 6:
+        return min(9, region.priority_tier)
+    if region.priority_tier == 1:
+        return 2 if region.level <= 1 else 3
+    if region.priority_tier in {2, 3}:
+        return 3
+    if region.priority_tier in {4, 5}:
+        return 5
     if region.level == 0 or (edge and bbox_ratio >= 0.01):
         return 1
     if region.level == 1:
@@ -812,6 +913,9 @@ def should_link_for_group(a: Region, b: Region, image_size: tuple[int, int]) -> 
     image_width, image_height = image_size
     max_gap_x = max(12, round(image_width * 0.35))
     max_gap_y = max(12, round(image_height * 0.18))
+
+    if min(a.priority_tier, b.priority_tier) <= 5 and max(a.priority_tier, b.priority_tier) >= 6:
+        return False
 
     same_y_band = overlap_ratio(a, b, "y") >= 0.72
     same_x_band = overlap_ratio(a, b, "x") >= 0.72
@@ -910,8 +1014,8 @@ def grouped_regions(raw_regions: list[Region], image_size: tuple[int, int]) -> l
             image_size,
         )
         candidate.element_kind = infer_element_kind(candidate, image_size)
-        candidate.display_depth = display_depth_for_region(candidate, image_size)
         score_region_importance(candidate, image_size, candidate.priority)
+        candidate.display_depth = display_depth_for_region(candidate, image_size)
         if candidate.level <= 2:
             synthetic.append(candidate)
             next_id += 1
@@ -948,6 +1052,8 @@ def assign_parent_links(
                 continue
             if parent.level >= region.level:
                 continue
+            if parent.priority_tier > region.priority_tier:
+                continue
             if not contains_region(parent, region, padding=4):
                 continue
             if is_parent_level(parent):
@@ -968,14 +1074,14 @@ def apply_hierarchy(
             image_size,
         )
         region.element_kind = infer_element_kind(region, image_size)
-        region.display_depth = display_depth_for_region(region, image_size)
         score_region_importance(region, image_size, region.priority)
+        region.display_depth = display_depth_for_region(region, image_size)
         region.report_group = f"region-{region.region_id}"
 
     synthetic_groups = grouped_regions(raw_regions, image_size)
     parent_candidates = sorted(
         [*synthetic_groups, *[region for region in raw_regions if is_parent_level(region)]],
-        key=lambda region: (region.level, -region.priority, region.y, region.x),
+        key=lambda region: (region.priority_tier, region.level, -region.priority, region.y, region.x),
     )
 
     if hierarchy_depth is not None:
@@ -989,6 +1095,7 @@ def apply_hierarchy(
         ]
         reported.sort(
             key=lambda region: (
+                region.priority_tier,
                 region.display_depth,
                 region.level,
                 -region.priority,
@@ -1018,6 +1125,8 @@ def apply_hierarchy(
                 continue
             if parent.level >= region.level:
                 continue
+            if parent.priority_tier > region.priority_tier:
+                continue
             if not contains_region(parent, region, padding=4):
                 continue
             if is_parent_level(parent):
@@ -1029,7 +1138,7 @@ def apply_hierarchy(
         if region.suppressed_by is None:
             reported.append(region)
 
-    reported.sort(key=lambda region: (region.level, -region.priority, region.y, region.x))
+    reported.sort(key=lambda region: (region.priority_tier, region.level, -region.priority, region.y, region.x))
     for report_id, region in enumerate(reported, start=1):
         region.report_id = report_id
 
@@ -1077,6 +1186,7 @@ def region_finding_text(
     else:
         reasons.append("detail-level finding")
 
+    reasons.append(f"priority tier {region.priority_tier}: {region.priority_category}")
     reasons.append(f"{region.element_kind} candidate")
     reasons.append(f"dominant signal: {region.dominant_signal}")
     reasons.append(f"severity {region.severity_score:.1f}/100, {region.confidence_level} confidence")
@@ -1353,6 +1463,8 @@ def save_regions(
             "display_depth": region.display_depth,
             "parent_id": region.parent_id,
             "priority": region.priority,
+            "priority_category": region.priority_category,
+            "priority_tier": region.priority_tier,
             "severity_score": region.severity_score,
             "severity_factors": region.severity_factors,
             "confidence": {
@@ -1409,9 +1521,20 @@ def save_regions(
                 "Sobel edge/stroke delta",
             ],
             "thresholds": signals.thresholds,
+            "priority_order": [
+                "1 size / layout dimensions",
+                "2 position / alignment",
+                "3 relative relationship / spacing",
+                "4 image / icon consistency",
+                "5 font metrics / typography",
+                "6 foreground color",
+                "7 background color",
+                "8 gradient",
+                "9 shadow / effect",
+            ],
             "ranking": (
-                "Regions are ranked within hierarchy by severity_score, using element kind, "
-                "screen position, edge proximity, coverage, density, and multi-channel evidence."
+                "Regions are ranked first by priority_tier, then hierarchy, then severity_score. "
+                "Geometry and relationship issues outrank color and decorative effects."
             ),
         },
         "hierarchy_policy": hierarchy_policy_text(hierarchy_depth, report_mode, effective_depth),
@@ -1477,7 +1600,14 @@ def main() -> int:
     mask = signals.combined_mask
     delta = signals.rgb_delta
     components = connected_components(mask, args.min_area)
-    merged = merge_components(components, args.merge_gap)
+    priority_mask = denoise_mask(signals.structure_mask | signals.edge_mask)
+    priority_components = connected_components(priority_mask, args.min_area)
+    merged = dedupe_components(
+        [
+            *merge_components(components, args.merge_gap),
+            *merge_components(priority_components, args.merge_gap),
+        ]
+    )
     regions = make_regions(merged, signals, args.max_regions)
     regions, reported_regions, suppressed_regions = apply_hierarchy(
         regions,

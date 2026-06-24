@@ -132,9 +132,22 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
     assert all("visual_evidence" in region for region in payload["reported_regions"])
     assert payload["diff_engine"]["mode"] == "multi-signal"
     assert "CIE Lab perceptual color distance" in payload["diff_engine"]["signals"]
+    assert payload["diff_engine"]["priority_order"] == [
+        "1 size / layout dimensions",
+        "2 position / alignment",
+        "3 relative relationship / spacing",
+        "4 image / icon consistency",
+        "5 font metrics / typography",
+        "6 foreground color",
+        "7 background color",
+        "8 gradient",
+        "9 shadow / effect",
+    ]
     assert "structure_dissimilarity" in payload["parameters"]["signal_thresholds"]
     assert all("element_kind" in region for region in payload["reported_regions"])
     assert all("severity_score" in region for region in payload["reported_regions"])
+    assert all("priority_tier" in region for region in payload["reported_regions"])
+    assert all("priority_category" in region for region in payload["reported_regions"])
     assert all("confidence" in region for region in payload["reported_regions"])
     assert all("diff_signals" in region for region in payload["reported_regions"])
     assert all(
@@ -335,8 +348,44 @@ def test_low_contrast_color_delta_is_detected_below_rgb_threshold(tmp_path):
     assert any(
         region["diff_signals"]["counts"]["color"] > 0
         and region["element_kind"] == "background/color fill"
+        and region["priority_category"] == "background color"
+        and region["priority_tier"] == 7
         for region in payload["reported_regions"]
     )
+
+
+def test_priority_ranking_prefers_geometry_over_background_color(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, size=(220, 150), color=(240, 240, 240))
+    actual = save_image(actual_path, size=(220, 150), color=(246, 246, 246))
+    expected_draw = ImageDraw.Draw(expected)
+    actual_draw = ImageDraw.Draw(actual)
+
+    expected_draw.rectangle((40, 44, 104, 88), fill=(30, 210, 120))
+    actual_draw.rectangle((52, 44, 116, 88), fill=(30, 210, 120))
+    expected_draw.rectangle((132, 48, 156, 72), fill=(20, 20, 20))
+    actual_draw.rectangle((132, 48, 156, 72), fill=(250, 250, 250))
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path)
+
+    reported = payload["reported_regions"]
+    assert reported
+    assert reported[0]["priority_tier"] <= 4
+    assert reported[0]["priority_category"] in {
+        "size / layout dimensions",
+        "position / alignment",
+        "relative relationship / spacing",
+        "image / icon consistency",
+    }
+    background_regions = [
+        region for region in reported if region["priority_category"] == "background color"
+    ]
+    assert background_regions
+    assert all(region["priority_tier"] == 7 for region in background_regions)
 
 
 def test_scales_expected_to_actual_when_dimensions_differ(tmp_path):
@@ -460,9 +509,10 @@ def test_depth_mode_keeps_detail_regions_inside_full_screen_edge_parent(tmp_path
     _, payload = run_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
 
     assert len(payload["reported_regions"]) > 1
-    assert any(region["display_depth"] == 1 for region in payload["reported_regions"])
+    assert any(region["priority_tier"] == 1 for region in payload["reported_regions"])
     assert any(
         region["display_depth"] == 5
+        and region["priority_tier"] == 4
         and region["x"] <= 64
         and region["x"] + region["width"] >= 48
         and region["y"] <= 60
@@ -487,6 +537,8 @@ def test_hierarchy_depth_five_includes_sparse_icon_edge_regions(tmp_path):
 
     assert any(
         region["display_depth"] == 5
+        and region["priority_tier"] == 4
+        and region["priority_category"] == "image / icon consistency"
         and region["category_hint"] == "typography/icon edge or alignment"
         for region in payload["reported_regions"]
     )
@@ -525,7 +577,11 @@ def test_report_mode_detail_selects_depth_five(tmp_path):
 
     assert payload["parameters"]["report_mode"] == "detail"
     assert payload["parameters"]["effective_hierarchy_depth"] == 5
-    assert any(region["display_depth"] == 5 for region in payload["reported_regions"])
+    assert any(
+        region["display_depth"] == 5
+        and region["priority_category"] == "image / icon consistency"
+        for region in payload["reported_regions"]
+    )
 
 
 def test_hierarchy_depth_overrides_report_mode_preset(tmp_path):

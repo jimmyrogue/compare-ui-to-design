@@ -111,7 +111,9 @@ Outputs:
 
 The diff engine is multi-signal. It combines RGB pixel distance, CIE Lab perceptual color distance, local structural dissimilarity, and Sobel edge/stroke delta before building candidate regions. This catches subtle color, border, icon, and typography-metric differences that a single RGB threshold can miss.
 
-`regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `display_depth`, `audit_focus`, `ignored_by_default`, a UI/UX category hint, `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
+`regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `display_depth`, `audit_focus`, `ignored_by_default`, a UI/UX category hint, `priority_tier`, `priority_category`, `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
+
+Report order is intentionally geometry-first: size/layout dimensions, position/alignment, relative relationship/spacing, image/icon consistency, font metrics/typography, foreground color, background color, gradient, then shadow/effects. `--report-mode detail` includes tiers 1-5 by default, so color-only backgrounds and decorative effects do not dominate the marked screenshot.
 
 The JSON also includes `audit_order: "top-down"`, `reported_regions`, `depth_regions`, `parent_regions`, `detail_regions`, `raw_regions`, and `suppressed_regions`. Use `reported_regions` for the main audit. In drilldown mode, `depth_regions` mirrors the selected preset/depth, `parent_regions` keeps page/module context, `detail_regions` isolates child findings, and `raw_regions` keeps every raw candidate for debugging.
 
@@ -302,7 +304,9 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 
 diff 引擎现在是多信号模式：先综合 RGB 像素距离、CIE Lab 感知色差、局部结构差异和 Sobel 边缘/描边差异，再生成候选区域。这样可以抓到单一 RGB 阈值容易漏掉的微妙颜色、边框、图标和字体指标差异。
 
-`regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`display_depth`、`audit_focus`、`ignored_by_default`、UI/UX 分类提示、`element_kind`、`severity_score`、`confidence`、`dominant_signal` 和 `diff_signals`。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
+`regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`display_depth`、`audit_focus`、`ignored_by_default`、UI/UX 分类提示、`priority_tier`、`priority_category`、`element_kind`、`severity_score`、`confidence`、`dominant_signal` 和 `diff_signals`。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
+
+报告顺序会优先看几何和结构：尺寸/布局、位置/对齐、相对关系/间距、图片/icon 一致性、字体指标/排版、前景色、背景色、渐变、阴影/效果。`--report-mode detail` 默认只包含 1-5 层，所以纯背景色和装饰效果不会主导标注截图。
 
 JSON 还会包含 `audit_order: "top-down"`、`reported_regions`、`depth_regions`、`parent_regions`、`detail_regions`、`raw_regions` 和 `suppressed_regions`。主报告应优先使用 `reported_regions`。在钻取模式下，`depth_regions` 对应当前 preset/depth，`parent_regions` 保留页面/模块上下文，`detail_regions` 聚焦子级细节，`raw_regions` 保留所有原始候选区域用于调试。
 

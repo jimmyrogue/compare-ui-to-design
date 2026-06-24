@@ -72,11 +72,12 @@ Audit from top to bottom in the UI hierarchy. Start with page-level layout, then
    - In hierarchy-depth mode, inspect `annotated_depth_actual.png` and `annotated_depth_expected.png` for the selected drilldown layer, and use `annotated_raw_actual.png` / `annotated_raw_expected.png` when you need every raw candidate region.
    - When a marker is broad, inspect `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, `diff_graymap.png`, `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` to locate the precise changed pixels that support the parent/module finding.
    - Open the per-region crop pair in `region_crops/` for each reported marker before deciding the exact issue. The crop pair is usually the clearest evidence for small typography, icon, border, radius, color, and alignment problems.
-   - Report modules, containers, images, icons, borders, backgrounds, gradients, typography metrics, spacing, margin, padding, and alignment first.
+   - Prioritize issues by visual implementation impact, not by raw color area. Use this order unless the user gives a different one: size/layout dimensions, position/alignment, relative relationship/spacing, image or icon consistency, font metrics/typography, foreground color, background color, gradient, then shadow/effects.
+   - Report modules, containers, images, icons, borders, typography metrics, spacing, margin, padding, and alignment before color-only and decorative effect differences.
    - Audit screen-edge regions explicitly: top inset, bottom inset, left/right rails, safe-area padding, full-bleed backgrounds, clipped cards, sticky headers/footers, and edge-aligned controls.
    - Prefer `reported_regions` from `regions.json` for the user-facing report. In drilldown mode, use `depth_regions` for the selected preset/depth, `parent_regions` for page/module context, `detail_regions` for inspectable child findings, and `raw_regions` only for debugging.
    - When a reported region includes `finding_summary`, `review_guidance`, or `edge_evidence`, use those fields as script evidence in the report. Do not dismiss a broad parent/module region as a false positive merely because it groups many child pixel differences.
-   - When a reported region includes `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`, use those fields to prioritize and explain the issue. `element_kind` is a hypothesis, not a final label; verify it against the actual/design crop pair.
+   - When a reported region includes `priority_tier`, `priority_category`, `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`, use those fields to prioritize and explain the issue. `element_kind` is a hypothesis, not a final label; verify it against the actual/design crop pair.
    - When a reported region includes `visual_evidence.diff_pixel_bbox` or `visual_evidence.region_crops`, use it to describe where the fine-grained evidence sits inside the broader marker. The marker is the top-down audit finding; the evidence maps and crops are supporting evidence, not extra report items by themselves.
    - If `edge_evidence.touches` includes an edge or `edge_evidence.margins` shows a very small margin such as `right=0px`, explicitly compare that edge against the design. State whether app-owned content is too close to the screen edge, clipped, missing safe-area padding, or using a different full-bleed background.
    - Treat `suppressed_child_count > 0` as evidence that the parent issue explains lower-level noise. Report the parent/root issue first, then inspect suppressed children only for independent icon, image, typography, color, or border problems.
@@ -115,7 +116,7 @@ Region crops: /absolute/path/to/region_crops
 - Screenshot size: 390x844.
 - Design normalization: expected image was proportionally fit into the actual screenshot canvas; no cropping was applied.
 - Script evidence for #4: edge margin top=0px; treat this parent/edge region as the primary UI/UX finding, not as a false positive.
-- Prioritization evidence: use severity_score, confidence, dominant_signal, and region crop pairs to decide which issues matter most.
+- Prioritization evidence: use priority_tier, priority_category, severity_score, confidence, dominant_signal, and region crop pairs to decide which issues matter most.
 - Copy-only and live-data differences were ignored unless they affected layout.
 - Device/system UI chrome, dynamic clock, and caret regions were ignored.
 ```

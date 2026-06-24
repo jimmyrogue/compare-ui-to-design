@@ -6,6 +6,8 @@ Use this reference to classify UI/UX implementation differences and decide what 
 
 - Compare in hierarchy order: page-level layout first, then top-level modules, nested modules, and finally element details.
 - Return parent/module problems before child details. If a parent layout, spacing, background, or edge issue explains child differences, do not expand every child region in the main report.
+- Prioritize findings by visual implementation impact: size/layout dimensions, position/alignment, relative relationship/spacing, image/icon consistency, font metrics/typography, foreground color, background color, gradient, then shadow/effects.
+- Do not let a large color-only background region outrank smaller but more actionable geometry, relationship, icon, or typography issues.
 - Report subtle but meaningful UI/UX differences: module position and size, color shifts, 1-2 px spacing changes, margin/padding drift, misalignment, font size/weight/line-height changes, missing or wrong icons, image crop/size changes, radius changes, shadow/elevation differences, border changes, and gradient color/direction differences.
 - Always check screen edges and safe-area boundaries as a separate pass: top, bottom, left, right, status-bar-adjacent areas, menu-bar-adjacent areas, home-indicator-adjacent areas, full-bleed backgrounds, and edge-aligned controls.
 - Filter isolated noise from anti-aliasing, compression, subpixel rendering, DPR rounding, text rasterization, and transparent edge pixels.
@@ -38,7 +40,7 @@ Do not use `Content` as a primary category. If text or data differs, classify on
 - Open `region_crops/` for reported markers before writing the final issue. The crop pair is usually the clearest evidence for small typography, icon, border, radius, shadow, color, and alignment problems.
 - Prefer `reported_regions` for the main report; treat `regions` as raw diff evidence and `suppressed_regions` as child noise explained by a parent issue.
 - If a reported region has `finding_summary`, use it as the first script-backed interpretation of that region. Do not replace it with a guess that the region is noise unless there is concrete capture/setup evidence.
-- If a reported region has `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`, use them to prioritize review order and explain why the region was surfaced. Treat `element_kind` as a hypothesis until verified against the actual/design crop pair.
+- If a reported region has `priority_tier`, `priority_category`, `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`, use them to prioritize review order and explain why the region was surfaced. Treat `element_kind` as a hypothesis until verified against the actual/design crop pair.
 - If a reported region has `review_guidance`, follow it before expanding child regions. In particular, a broad parent region that touches screen edges or explains suppressed children is a high-priority UI/UX finding, not a low-value pixel artifact.
 - If a reported region has `edge_evidence`, translate the edge margins into concrete UI observations: for example, `right=0px` means the actual app-owned region reaches the right screenshot edge and should be checked for missing side gutter, safe-area padding, or clipping against the design.
 - If a reported region has `visual_evidence.diff_pixel_bbox`, use that box to state where the precise pixel evidence is concentrated within the broader parent/module marker.
