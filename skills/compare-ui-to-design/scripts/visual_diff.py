@@ -42,6 +42,14 @@ class Region:
     report_group: str = ""
     report_id: int | None = None
     source_region_ids: tuple[int, ...] = field(default_factory=tuple)
+    element_kind: str = "ui visual region"
+    dominant_signal: str = "rgb"
+    signal_counts: dict[str, int] = field(default_factory=dict)
+    signal_strengths: dict[str, float] = field(default_factory=dict)
+    severity_score: float = 0.0
+    confidence_score: float = 0.0
+    confidence_level: str = "medium"
+    severity_factors: list[str] = field(default_factory=list)
 
     @property
     def right(self) -> int:
@@ -54,6 +62,20 @@ class Region:
     @property
     def bbox_area(self) -> int:
         return self.width * self.height
+
+
+@dataclass
+class DiffSignals:
+    rgb_delta: np.ndarray
+    color_delta: np.ndarray
+    structure_delta: np.ndarray
+    edge_delta: np.ndarray
+    rgb_mask: np.ndarray
+    color_mask: np.ndarray
+    structure_mask: np.ndarray
+    edge_mask: np.ndarray
+    combined_mask: np.ndarray
+    thresholds: dict[str, float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -183,14 +205,165 @@ def normalize_expected_to_actual(
     }
 
 
+def luminance(rgb: np.ndarray) -> np.ndarray:
+    return (
+        rgb[..., 0] * 0.2126
+        + rgb[..., 1] * 0.7152
+        + rgb[..., 2] * 0.0722
+    ).astype(np.float32)
+
+
+def box_mean(values: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return values.astype(np.float32)
+
+    window = radius * 2 + 1
+    padded = np.pad(values.astype(np.float64), radius, mode="reflect")
+    integral = np.pad(padded, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    height, width = values.shape
+    summed = (
+        integral[window : window + height, window : window + width]
+        - integral[:height, window : window + width]
+        - integral[window : window + height, :width]
+        + integral[:height, :width]
+    )
+    return (summed / float(window * window)).astype(np.float32)
+
+
+def structural_dissimilarity(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
+    actual_gray = luminance(actual)
+    expected_gray = luminance(expected)
+    radius = 3
+    c1 = (0.01 * 255) ** 2
+    c2 = (0.03 * 255) ** 2
+
+    actual_mean = box_mean(actual_gray, radius)
+    expected_mean = box_mean(expected_gray, radius)
+    actual_var = box_mean(actual_gray * actual_gray, radius) - actual_mean * actual_mean
+    expected_var = box_mean(expected_gray * expected_gray, radius) - expected_mean * expected_mean
+    covariance = box_mean(actual_gray * expected_gray, radius) - actual_mean * expected_mean
+
+    numerator = (2 * actual_mean * expected_mean + c1) * (2 * covariance + c2)
+    denominator = (actual_mean * actual_mean + expected_mean * expected_mean + c1) * (
+        actual_var + expected_var + c2
+    )
+    similarity = numerator / np.maximum(denominator, 1e-6)
+    return np.clip(1.0 - similarity, 0.0, 1.0).astype(np.float32)
+
+
+def sobel_magnitude(values: np.ndarray) -> np.ndarray:
+    padded = np.pad(values.astype(np.float32), 1, mode="reflect")
+    left = padded[:-2, :-2] + 2 * padded[1:-1, :-2] + padded[2:, :-2]
+    right = padded[:-2, 2:] + 2 * padded[1:-1, 2:] + padded[2:, 2:]
+    top = padded[:-2, :-2] + 2 * padded[:-2, 1:-1] + padded[:-2, 2:]
+    bottom = padded[2:, :-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:]
+    gx = right - left
+    gy = bottom - top
+    return np.sqrt(gx * gx + gy * gy).astype(np.float32)
+
+
+def edge_delta(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
+    return np.abs(sobel_magnitude(luminance(actual)) - sobel_magnitude(luminance(expected)))
+
+
+def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    srgb = np.clip(rgb / 255.0, 0.0, 1.0)
+    linear = np.where(
+        srgb > 0.04045,
+        ((srgb + 0.055) / 1.055) ** 2.4,
+        srgb / 12.92,
+    )
+    matrix = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ],
+        dtype=np.float32,
+    )
+    xyz = np.tensordot(linear, matrix.T, axes=1)
+    xyz = xyz / np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+    epsilon = 216 / 24389
+    kappa = 24389 / 27
+    f = np.where(xyz > epsilon, np.cbrt(xyz), (kappa * xyz + 16) / 116)
+    lab = np.empty_like(xyz, dtype=np.float32)
+    lab[..., 0] = 116 * f[..., 1] - 16
+    lab[..., 1] = 500 * (f[..., 0] - f[..., 1])
+    lab[..., 2] = 200 * (f[..., 1] - f[..., 2])
+    return lab
+
+
+def perceptual_color_delta(actual: np.ndarray, expected: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(rgb_to_lab(actual) - rgb_to_lab(expected), axis=2).astype(np.float32)
+
+
+def expand_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return mask.copy()
+
+    expanded = np.zeros_like(mask, dtype=bool)
+    height, width = mask.shape
+    padded = np.pad(mask, radius, mode="constant")
+    diameter = radius * 2 + 1
+    for dy in range(diameter):
+        for dx in range(diameter):
+            expanded |= padded[dy : dy + height, dx : dx + width]
+    return expanded
+
+
+def build_difference_signals(
+    actual: np.ndarray,
+    expected: np.ndarray,
+    threshold: float,
+) -> DiffSignals:
+    rgb_delta = np.linalg.norm(actual - expected, axis=2).astype(np.float32)
+    color_delta = perceptual_color_delta(actual, expected)
+    structure_delta = structural_dissimilarity(actual, expected)
+    edges = edge_delta(actual, expected)
+
+    color_threshold = max(2.0, threshold * 0.16)
+    structure_threshold = max(0.045, min(0.12, threshold / 255.0))
+    edge_threshold = max(18.0, threshold * 1.5)
+
+    rgb_mask = rgb_delta >= threshold
+    color_mask = color_delta >= color_threshold
+    soft_mask = (rgb_delta >= threshold * 0.5) | (color_delta >= color_threshold * 0.75)
+    coherent_support = expand_mask(denoise_mask(soft_mask), 1)
+    structure_mask = (structure_delta >= structure_threshold) & coherent_support
+    edge_mask = (edges >= edge_threshold) & coherent_support
+    combined_mask = denoise_mask(rgb_mask | color_mask | structure_mask | edge_mask)
+
+    return DiffSignals(
+        rgb_delta=rgb_delta,
+        color_delta=color_delta,
+        structure_delta=structure_delta,
+        edge_delta=edges,
+        rgb_mask=rgb_mask,
+        color_mask=color_mask,
+        structure_mask=structure_mask,
+        edge_mask=edge_mask,
+        combined_mask=combined_mask,
+        thresholds={
+            "rgb": round(threshold, 4),
+            "color_delta_e": round(color_threshold, 4),
+            "structure_dissimilarity": round(structure_threshold, 4),
+            "edge_delta": round(edge_threshold, 4),
+        },
+    )
+
+
 def build_difference_mask(
     actual: np.ndarray,
     expected: np.ndarray,
     threshold: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    delta = np.linalg.norm(actual - expected, axis=2)
-    mask = delta >= threshold
-    return mask, delta
+    signals = build_difference_signals(actual, expected, threshold)
+    return signals.combined_mask, signals.rgb_delta
+
+
+def draw_scaled_graymap(values: np.ndarray, upper: float) -> Image.Image:
+    normalized = (np.clip(values, 0, upper) / upper * 255).astype(np.uint8)
+    return Image.fromarray(normalized)
 
 
 def denoise_mask(mask: np.ndarray) -> np.ndarray:
@@ -316,25 +489,191 @@ def category_hint(width: int, height: int, area: int, mean_delta: float) -> str:
     return "ui visual difference"
 
 
+def signal_metrics_for_pixels(
+    pixels: list[tuple[int, int]],
+    signals: DiffSignals,
+) -> tuple[dict[str, int], dict[str, float], str]:
+    if not pixels:
+        return {}, {}, "rgb"
+
+    xs = np.array([x for x, _ in pixels], dtype=np.intp)
+    ys = np.array([y for _, y in pixels], dtype=np.intp)
+    masks = {
+        "rgb": signals.rgb_mask,
+        "color": signals.color_mask,
+        "structure": signals.structure_mask,
+        "edge": signals.edge_mask,
+    }
+    values = {
+        "rgb": signals.rgb_delta,
+        "color_delta_e": signals.color_delta,
+        "structure_dissimilarity": signals.structure_delta,
+        "edge": signals.edge_delta,
+    }
+    counts = {name: int(mask[ys, xs].sum()) for name, mask in masks.items()}
+    strengths = {
+        name: round(float(value[ys, xs].mean()), 4)
+        for name, value in values.items()
+    }
+    strength_keys = {
+        "rgb": "rgb",
+        "color": "color_delta_e",
+        "structure": "structure_dissimilarity",
+        "edge": "edge",
+    }
+    dominant = max(
+        counts,
+        key=lambda name: (counts[name], strengths[strength_keys[name]]),
+    )
+    return counts, strengths, dominant
+
+
+def infer_element_kind(region: Region, image_size: tuple[int, int]) -> str:
+    image_width, image_height = image_size
+    image_area = image_width * image_height
+    bbox_ratio = region.bbox_area / max(1, image_area)
+    fill_ratio = region.area / max(1, region.bbox_area)
+    hint = region.category_hint.lower()
+    edge = touches_screen_edge(region, image_size)
+    color_count = region.signal_counts.get("color", 0)
+    structure_count = region.signal_counts.get("structure", 0)
+    edge_count = region.signal_counts.get("edge", 0)
+    rgb_count = region.signal_counts.get("rgb", 0)
+
+    if edge and (
+        region.width / max(1, image_width) >= 0.24
+        or region.height / max(1, image_height) >= 0.16
+    ):
+        return "screen-edge/safe-area"
+    if is_thin_horizontal(region) or is_thin_vertical(region):
+        return "border/divider"
+    if (
+        color_count >= max(structure_count + edge_count, rgb_count // 2)
+        and structure_count <= color_count * 0.35
+        and edge_count <= color_count * 0.35
+        and region.area >= 240
+    ):
+        return "background/color fill"
+    if bbox_ratio >= 0.035 or "layout" in hint:
+        return "module/container"
+    if "typography" in hint and fill_ratio < 0.35:
+        return "typography/text metrics"
+    if region.width <= 96 and region.height <= 96 and (edge_count or structure_count or "icon" in hint):
+        return "icon/image detail"
+    if fill_ratio < 0.22:
+        return "typography/icon stroke"
+    return "ui visual region"
+
+
+def score_region_importance(region: Region, image_size: tuple[int, int], base_priority: float) -> None:
+    image_width, image_height = image_size
+    image_area = image_width * image_height
+    bbox_ratio = region.bbox_area / max(1, image_area)
+    changed_ratio = region.area / max(1, image_area)
+    density = region.area / max(1, region.bbox_area)
+    signal_count = sum(1 for value in region.signal_counts.values() if value > 0)
+    structure_strength = region.signal_strengths.get("structure_dissimilarity", 0.0)
+    color_strength = region.signal_strengths.get("color_delta_e", 0.0)
+    edge_strength = region.signal_strengths.get("edge", 0.0)
+    edge = touches_screen_edge(region, image_size)
+
+    kind_weights = {
+        "screen-edge/safe-area": 1.28,
+        "module/container": 1.18,
+        "typography/text metrics": 1.18,
+        "icon/image detail": 1.14,
+        "border/divider": 1.1,
+        "typography/icon stroke": 1.08,
+        "background/color fill": 0.82,
+        "ui visual region": 1.0,
+    }
+    kind_weight = kind_weights.get(region.element_kind, 1.0)
+    first_screen_weight = 1.12 if region.y < image_height * 0.42 else 1.0
+    multi_signal_weight = 1.0 + min(0.24, max(0, signal_count - 1) * 0.08)
+    edge_weight = 1.12 if edge else 1.0
+
+    visual_strength = min(1.0, region.mean_delta / 80.0)
+    color_strength_norm = min(1.0, color_strength / 20.0)
+    structure_strength_norm = min(1.0, structure_strength / 0.24)
+    edge_strength_norm = min(1.0, edge_strength / 140.0)
+    coverage_score = min(1.0, bbox_ratio / 0.10) * 0.28 + min(1.0, changed_ratio / 0.025) * 0.28
+    detail_score = max(visual_strength, color_strength_norm, structure_strength_norm, edge_strength_norm) * 0.36
+    density_score = min(1.0, density / 0.65) * 0.08
+
+    severity = (coverage_score + detail_score + density_score) * kind_weight * first_screen_weight * multi_signal_weight * edge_weight
+    severity = max(1.0, min(100.0, severity * 100.0))
+
+    factors: list[str] = []
+    if edge:
+        factors.append("screen-edge proximity")
+    if signal_count >= 2:
+        factors.append(f"{signal_count} diff signal channels")
+    if bbox_ratio >= 0.035:
+        factors.append("module-scale coverage")
+    if density >= 0.55:
+        factors.append("dense changed pixels")
+    if structure_strength_norm >= 0.35:
+        factors.append("structural shape change")
+    if color_strength_norm >= 0.35:
+        factors.append("perceptual color shift")
+    if edge_strength_norm >= 0.35:
+        factors.append("edge/stroke movement")
+    if region.y < image_height * 0.42:
+        factors.append("first-screen placement")
+
+    confidence = 0.42 + min(0.24, density * 0.26) + min(0.18, signal_count * 0.06)
+    if region.area >= 48:
+        confidence += 0.08
+    if bbox_ratio >= 0.008:
+        confidence += 0.06
+    if region.dominant_signal == "structure" and signal_count == 1:
+        confidence -= 0.10
+    confidence = max(0.1, min(0.99, confidence))
+
+    region.severity_score = round(severity, 2)
+    region.confidence_score = round(confidence, 3)
+    region.confidence_level = "high" if confidence >= 0.72 else "medium" if confidence >= 0.5 else "low"
+    region.severity_factors = factors
+    region.priority = round(region.severity_score * 1000.0 + base_priority * 0.02, 2)
+
+
 def make_regions(
     components: Iterable[tuple[int, int, int, int, int, list[tuple[int, int]]]],
-    delta: np.ndarray,
+    signals: DiffSignals,
     max_regions: int,
 ) -> list[Region]:
     scored = []
     for x1, y1, x2, y2, area, pixels in components:
-        pixel_deltas = np.array([delta[y, x] for x, y in pixels], dtype=np.float32)
+        pixel_deltas = np.array([signals.rgb_delta[y, x] for x, y in pixels], dtype=np.float32)
         mean_delta = float(pixel_deltas.mean()) if len(pixel_deltas) else 0.0
         max_delta = float(pixel_deltas.max()) if len(pixel_deltas) else 0.0
-        score = area * math.log(max(mean_delta, 1.0) + 1)
-        scored.append((score, x1, y1, x2, y2, area, mean_delta, max_delta))
+        signal_counts, signal_strengths, dominant_signal = signal_metrics_for_pixels(pixels, signals)
+        signal_bonus = 1.0 + min(0.35, sum(1 for value in signal_counts.values() if value > 0) * 0.08)
+        structure_bonus = 1.0 + min(0.30, signal_strengths.get("structure_dissimilarity", 0.0) * 1.6)
+        edge_bonus = 1.0 + min(0.25, signal_strengths.get("edge", 0.0) / 180.0)
+        score = area * math.log(max(mean_delta, 1.0) + 1) * signal_bonus * structure_bonus * edge_bonus
+        scored.append(
+            (
+                score,
+                x1,
+                y1,
+                x2,
+                y2,
+                area,
+                mean_delta,
+                max_delta,
+                signal_counts,
+                signal_strengths,
+                dominant_signal,
+            )
+        )
 
     scored.sort(reverse=True)
     selected = scored[:max_regions]
     selected.sort(key=lambda item: (item[2], item[1]))
 
     regions: list[Region] = []
-    for idx, (_, x1, y1, x2, y2, area, mean_delta, max_delta) in enumerate(selected, start=1):
+    for idx, (_, x1, y1, x2, y2, area, mean_delta, max_delta, signal_counts, signal_strengths, dominant_signal) in enumerate(selected, start=1):
         width = x2 - x1
         height = y2 - y1
         regions.append(
@@ -349,6 +688,9 @@ def make_regions(
                 max_delta=round(max_delta, 2),
                 category_hint=category_hint(width, height, area, mean_delta),
                 source_region_ids=(idx,),
+                dominant_signal=dominant_signal,
+                signal_counts=signal_counts,
+                signal_strengths=signal_strengths,
             )
         )
 
@@ -534,6 +876,18 @@ def grouped_regions(raw_regions: list[Region], image_size: tuple[int, int]) -> l
             2,
         )
         max_delta = max(region.max_delta for region in source_regions)
+        signal_counts = {
+            name: sum(region.signal_counts.get(name, 0) for region in source_regions)
+            for name in ("rgb", "color", "structure", "edge")
+        }
+        signal_strengths = {}
+        for name in ("rgb", "color_delta_e", "structure_dissimilarity", "edge"):
+            signal_strengths[name] = round(
+                sum(region.signal_strengths.get(name, 0.0) * region.area for region in source_regions)
+                / max(area, 1),
+                4,
+            )
+        dominant_signal = max(signal_counts, key=lambda name: signal_counts[name])
         source_ids = tuple(region.region_id for region in source_regions)
         candidate = Region(
             region_id=next_id,
@@ -547,12 +901,17 @@ def grouped_regions(raw_regions: list[Region], image_size: tuple[int, int]) -> l
             category_hint="module layout/spacing group",
             report_group=f"group-{next_id}",
             source_region_ids=source_ids,
+            dominant_signal=dominant_signal,
+            signal_counts=signal_counts,
+            signal_strengths=signal_strengths,
         )
         candidate.level, candidate.priority, candidate.category_hint = classify_hierarchy_level(
             candidate,
             image_size,
         )
+        candidate.element_kind = infer_element_kind(candidate, image_size)
         candidate.display_depth = display_depth_for_region(candidate, image_size)
+        score_region_importance(candidate, image_size, candidate.priority)
         if candidate.level <= 2:
             synthetic.append(candidate)
             next_id += 1
@@ -608,7 +967,9 @@ def apply_hierarchy(
             region,
             image_size,
         )
+        region.element_kind = infer_element_kind(region, image_size)
         region.display_depth = display_depth_for_region(region, image_size)
+        score_region_importance(region, image_size, region.priority)
         region.report_group = f"region-{region.region_id}"
 
     synthetic_groups = grouped_regions(raw_regions, image_size)
@@ -716,6 +1077,9 @@ def region_finding_text(
     else:
         reasons.append("detail-level finding")
 
+    reasons.append(f"{region.element_kind} candidate")
+    reasons.append(f"dominant signal: {region.dominant_signal}")
+    reasons.append(f"severity {region.severity_score:.1f}/100, {region.confidence_level} confidence")
     if width_ratio >= 0.70 or height_ratio >= 0.55:
         reasons.append(
             f"large coverage ({region.width}x{region.height}, "
@@ -730,10 +1094,13 @@ def region_finding_text(
         reasons.append(f"explains {child_count} suppressed child diff region(s)")
     if region.source_region_ids and len(region.source_region_ids) > 1:
         reasons.append(f"groups raw regions {list(region.source_region_ids)}")
+    if region.severity_factors:
+        reasons.append("importance factors: " + ", ".join(region.severity_factors))
 
     guidance = [
         "Treat this reported region as the primary UI/UX finding, not as a false positive.",
         "Compare the actual screenshot against the design at this parent/module level before inspecting child details.",
+        "Use the region crop pair and diff-channel evidence to verify the exact visual property before reporting.",
     ]
     if touches:
         guidance.append(
@@ -810,6 +1177,67 @@ def draw_graymap(delta: np.ndarray) -> Image.Image:
     return Image.fromarray(normalized)
 
 
+def padded_bbox(region: Region, image_size: tuple[int, int], padding: int = 12) -> tuple[int, int, int, int]:
+    image_width, image_height = image_size
+    return (
+        max(0, region.x - padding),
+        max(0, region.y - padding),
+        min(image_width, region.right + padding),
+        min(image_height, region.bottom + padding),
+    )
+
+
+def crop_mask(mask: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
+    x1, y1, x2, y2 = bbox
+    return mask[y1:y2, x1:x2]
+
+
+def save_region_crops(
+    out_dir: Path,
+    actual_image: Image.Image,
+    expected_image: Image.Image,
+    signals: DiffSignals,
+    evidence_mask: np.ndarray,
+    regions: list[Region],
+) -> dict[int, dict[str, object]]:
+    crop_dir = out_dir / "region_crops"
+    crop_dir.mkdir(parents=True, exist_ok=True)
+    crop_paths: dict[int, dict[str, object]] = {}
+
+    for region in regions:
+        label = f"{region.report_id or region.region_id:02d}"
+        bbox = padded_bbox(region, actual_image.size)
+        x1, y1, x2, y2 = bbox
+        actual_crop = actual_image.crop(bbox)
+        expected_crop = expected_image.crop(bbox)
+        rgb_crop = signals.rgb_delta[y1:y2, x1:x2]
+        evidence_crop_mask = crop_mask(evidence_mask, bbox)
+
+        actual_path = crop_dir / f"{label}_actual.png"
+        expected_path = crop_dir / f"{label}_expected.png"
+        diff_path = crop_dir / f"{label}_diff_heatmap.png"
+        evidence_path = crop_dir / f"{label}_evidence_overlay.png"
+
+        actual_crop.save(actual_path)
+        expected_crop.save(expected_path)
+        draw_heatmap(rgb_crop).save(diff_path)
+        draw_evidence_overlay(actual_crop, evidence_crop_mask, []).save(evidence_path)
+        crop_paths[region.region_id] = {
+            "actual": str(actual_path),
+            "expected": str(expected_path),
+            "diff_heatmap": str(diff_path),
+            "evidence_overlay": str(evidence_path),
+            "bbox": {
+                "x": x1,
+                "y": y1,
+                "width": x2 - x1,
+                "height": y2 - y1,
+            },
+        }
+
+    return crop_paths
+
+
 def diff_pixel_evidence(region: Region, mask: np.ndarray) -> tuple[int, dict[str, int] | None]:
     region_mask = mask[region.y : region.bottom, region.x : region.right]
     ys, xs = np.nonzero(region_mask)
@@ -871,6 +1299,8 @@ def save_regions(
     report_mode: str | None,
     effective_depth: int | None,
     mask: np.ndarray,
+    signals: DiffSignals,
+    crop_artifacts: dict[int, dict[str, object]],
     regions: list[Region],
     reported_regions: list[Region],
     suppressed_regions: list[Region],
@@ -882,6 +1312,10 @@ def save_regions(
         "evidence_overlay_expected": str(out_dir / "evidence_overlay_expected.png"),
         "diff_heatmap": str(out_dir / "diff_heatmap.png"),
         "diff_graymap": str(out_dir / "diff_graymap.png"),
+        "diff_color_delta": str(out_dir / "diff_color_delta.png"),
+        "diff_structure": str(out_dir / "diff_structure.png"),
+        "diff_edges": str(out_dir / "diff_edges.png"),
+        "region_crops": str(out_dir / "region_crops"),
         "annotated_raw_actual": str(out_dir / "annotated_raw_actual.png"),
         "annotated_raw_expected": str(out_dir / "annotated_raw_expected.png"),
         "annotated_depth_actual": str(out_dir / "annotated_depth_actual.png"),
@@ -914,10 +1348,22 @@ def save_regions(
             "mean_delta": region.mean_delta,
             "max_delta": region.max_delta,
             "category_hint": region.category_hint,
+            "element_kind": region.element_kind,
             "level": region.level,
             "display_depth": region.display_depth,
             "parent_id": region.parent_id,
             "priority": region.priority,
+            "severity_score": region.severity_score,
+            "severity_factors": region.severity_factors,
+            "confidence": {
+                "level": region.confidence_level,
+                "score": region.confidence_score,
+            },
+            "dominant_signal": region.dominant_signal,
+            "diff_signals": {
+                "counts": region.signal_counts,
+                "mean_strengths": region.signal_strengths,
+            },
             "suppressed_by": region.suppressed_by,
             "report_group": region.report_group,
             "source_region_ids": list(region.source_region_ids),
@@ -932,6 +1378,7 @@ def save_regions(
                 "uses_suppressed_children": child_count > 0,
                 "diff_pixel_count": diff_pixel_count,
                 "diff_pixel_bbox": diff_pixel_bbox,
+                "region_crops": crop_artifacts.get(region.region_id),
             },
         }
 
@@ -953,6 +1400,20 @@ def save_regions(
             "device/system UI chrome",
             "rasterization-only noise",
         ],
+        "diff_engine": {
+            "mode": "multi-signal",
+            "signals": [
+                "rgb pixel distance",
+                "CIE Lab perceptual color distance",
+                "local structural dissimilarity",
+                "Sobel edge/stroke delta",
+            ],
+            "thresholds": signals.thresholds,
+            "ranking": (
+                "Regions are ranked within hierarchy by severity_score, using element kind, "
+                "screen position, edge proximity, coverage, density, and multi-channel evidence."
+            ),
+        },
         "hierarchy_policy": hierarchy_policy_text(hierarchy_depth, report_mode, effective_depth),
         "normalization_policy": (
             "The actual screenshot is the coordinate baseline. If the design image size differs, "
@@ -971,6 +1432,7 @@ def save_regions(
             "hierarchy_depth": hierarchy_depth,
             "report_mode": report_mode,
             "effective_hierarchy_depth": effective_depth,
+            "signal_thresholds": signals.thresholds,
         },
         "regions": [region_payload(region) for region in regions],
         "reported_regions": [region_payload(region) for region in reported_regions],
@@ -1011,11 +1473,12 @@ def main() -> int:
     )
     expected_array = np.asarray(expected_image, dtype=np.float32)
 
-    mask, delta = build_difference_mask(actual_array, expected_array, args.threshold)
-    mask = denoise_mask(mask)
+    signals = build_difference_signals(actual_array, expected_array, args.threshold)
+    mask = signals.combined_mask
+    delta = signals.rgb_delta
     components = connected_components(mask, args.min_area)
     merged = merge_components(components, args.merge_gap)
-    regions = make_regions(merged, delta, args.max_regions)
+    regions = make_regions(merged, signals, args.max_regions)
     regions, reported_regions, suppressed_regions = apply_hierarchy(
         regions,
         actual_image.size,
@@ -1023,6 +1486,14 @@ def main() -> int:
     )
 
     evidence_mask = evidence_mask_for_regions(mask, reported_regions)
+    crop_artifacts = save_region_crops(
+        out_dir,
+        actual_image,
+        expected_image,
+        signals,
+        evidence_mask,
+        reported_regions,
+    )
     annotated = draw_annotations(actual_image, reported_regions)
     annotated_expected = draw_annotations(expected_image, reported_regions)
     annotated_raw = draw_annotations(actual_image, regions)
@@ -1033,6 +1504,9 @@ def main() -> int:
     evidence_overlay_expected = draw_evidence_overlay(expected_image, evidence_mask, reported_regions)
     heatmap = draw_heatmap(delta)
     graymap = draw_graymap(delta)
+    color_map = draw_scaled_graymap(signals.color_delta, 32.0)
+    structure_map = draw_scaled_graymap(signals.structure_delta, 0.35)
+    edge_map = draw_scaled_graymap(signals.edge_delta, 192.0)
 
     annotated.save(out_dir / "annotated_actual.png")
     annotated_expected.save(out_dir / "annotated_expected.png")
@@ -1044,6 +1518,9 @@ def main() -> int:
     evidence_overlay_expected.save(out_dir / "evidence_overlay_expected.png")
     heatmap.save(out_dir / "diff_heatmap.png")
     graymap.save(out_dir / "diff_graymap.png")
+    color_map.save(out_dir / "diff_color_delta.png")
+    structure_map.save(out_dir / "diff_structure.png")
+    edge_map.save(out_dir / "diff_edges.png")
     save_regions(
         out_dir=out_dir,
         actual_path=actual_path,
@@ -1059,6 +1536,8 @@ def main() -> int:
         report_mode=args.report_mode,
         effective_depth=effective_depth,
         mask=mask,
+        signals=signals,
+        crop_artifacts=crop_artifacts,
         regions=regions,
         reported_regions=reported_regions,
         suppressed_regions=suppressed_regions,
@@ -1079,6 +1558,10 @@ def main() -> int:
     print(f"- {out_dir / 'evidence_overlay_expected.png'}")
     print(f"- {out_dir / 'diff_heatmap.png'}")
     print(f"- {out_dir / 'diff_graymap.png'}")
+    print(f"- {out_dir / 'diff_color_delta.png'}")
+    print(f"- {out_dir / 'diff_structure.png'}")
+    print(f"- {out_dir / 'diff_edges.png'}")
+    print(f"- {out_dir / 'region_crops'}")
     print(f"- {out_dir / 'regions.json'}")
     return 0
 

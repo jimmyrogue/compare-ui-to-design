@@ -93,6 +93,10 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
     assert (out_dir / "evidence_overlay_expected.png").exists()
     assert (out_dir / "diff_heatmap.png").exists()
     assert (out_dir / "diff_graymap.png").exists()
+    assert (out_dir / "diff_color_delta.png").exists()
+    assert (out_dir / "diff_structure.png").exists()
+    assert (out_dir / "diff_edges.png").exists()
+    assert (out_dir / "region_crops").exists()
     assert (out_dir / "annotated_raw_actual.png").exists()
     assert (out_dir / "annotated_raw_expected.png").exists()
     assert (out_dir / "annotated_depth_actual.png").exists()
@@ -104,6 +108,10 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
         "evidence_overlay_expected": str(out_dir / "evidence_overlay_expected.png"),
         "diff_heatmap": str(out_dir / "diff_heatmap.png"),
         "diff_graymap": str(out_dir / "diff_graymap.png"),
+        "diff_color_delta": str(out_dir / "diff_color_delta.png"),
+        "diff_structure": str(out_dir / "diff_structure.png"),
+        "diff_edges": str(out_dir / "diff_edges.png"),
+        "region_crops": str(out_dir / "region_crops"),
         "annotated_raw_actual": str(out_dir / "annotated_raw_actual.png"),
         "annotated_raw_expected": str(out_dir / "annotated_raw_expected.png"),
         "annotated_depth_actual": str(out_dir / "annotated_depth_actual.png"),
@@ -122,6 +130,21 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
     assert all("content" not in region["category_hint"].lower() for region in payload["regions"])
     assert all("data" not in region["category_hint"].lower() for region in payload["regions"])
     assert all("visual_evidence" in region for region in payload["reported_regions"])
+    assert payload["diff_engine"]["mode"] == "multi-signal"
+    assert "CIE Lab perceptual color distance" in payload["diff_engine"]["signals"]
+    assert "structure_dissimilarity" in payload["parameters"]["signal_thresholds"]
+    assert all("element_kind" in region for region in payload["reported_regions"])
+    assert all("severity_score" in region for region in payload["reported_regions"])
+    assert all("confidence" in region for region in payload["reported_regions"])
+    assert all("diff_signals" in region for region in payload["reported_regions"])
+    assert all(
+        region["visual_evidence"]["region_crops"] is not None
+        for region in payload["reported_regions"]
+    )
+    for region in payload["reported_regions"]:
+        for path in region["visual_evidence"]["region_crops"].values():
+            if isinstance(path, str):
+                assert Path(path).exists()
     assert payload["parameters"]["hierarchy_depth"] is None
     assert all("display_depth" in region for region in payload["regions"])
     assert all(1 <= region["display_depth"] <= 9 for region in payload["regions"])
@@ -291,6 +314,29 @@ def test_filters_isolated_noise(tmp_path):
     _, payload = run_diff(tmp_path, actual_path, expected_path)
 
     assert payload["regions"] == []
+
+
+def test_low_contrast_color_delta_is_detected_below_rgb_threshold(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, size=(120, 80), color=(255, 255, 255))
+    actual = save_image(actual_path, size=(120, 80), color=(255, 255, 255))
+    ImageDraw.Draw(expected).rectangle((20, 18, 100, 58), fill=(240, 240, 240))
+    ImageDraw.Draw(actual).rectangle((20, 18, 100, 58), fill=(246, 246, 246))
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path)
+
+    assert payload["regions"]
+    assert all(region["mean_delta"] < payload["parameters"]["threshold"] for region in payload["regions"])
+    assert any(region["dominant_signal"] == "color" for region in payload["regions"])
+    assert any(
+        region["diff_signals"]["counts"]["color"] > 0
+        and region["element_kind"] == "background/color fill"
+        for region in payload["reported_regions"]
+    )
 
 
 def test_scales_expected_to_actual_when_dimensions_differ(tmp_path):
