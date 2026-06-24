@@ -23,6 +23,17 @@ REPORT_MODE_DEPTHS = {
 }
 
 Component = tuple[int, int, int, int, int, list[tuple[int, int]]]
+BOX_KEYS = ("x", "y", "width", "height")
+NODE_KINDS = {
+    "screen",
+    "container",
+    "text",
+    "icon",
+    "image",
+    "control",
+    "background",
+    "unknown",
+}
 
 
 @dataclass
@@ -82,6 +93,79 @@ class DiffSignals:
     thresholds: dict[str, float]
 
 
+@dataclass
+class UINode:
+    node_id: str
+    parent_id: str | None
+    name: str
+    kind: str
+    x: int
+    y: int
+    width: int
+    height: int
+    text: str = ""
+    style: dict[str, object] = field(default_factory=dict)
+    visible: bool = True
+    confidence: float = 1.0
+    source_method: str = "unknown"
+    children: list[str] = field(default_factory=list)
+
+    @property
+    def right(self) -> int:
+        return self.x + self.width
+
+    @property
+    def bottom(self) -> int:
+        return self.y + self.height
+
+    @property
+    def bbox_area(self) -> int:
+        return self.width * self.height
+
+    @property
+    def center(self) -> tuple[float, float]:
+        return (self.x + self.width / 2.0, self.y + self.height / 2.0)
+
+
+@dataclass
+class NodeMatch:
+    match_id: str
+    expected_node: UINode | None
+    actual_node: UINode | None
+    status: str
+    cost: float = 1.0
+    local_box: tuple[int, int, int, int] | None = None
+    local_score: float | None = None
+    delta: dict[str, int] = field(default_factory=dict)
+    parent_delta: dict[str, int] = field(default_factory=dict)
+    residual_delta: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class UIIssue:
+    issue_id: str
+    issue_type: str
+    category: str
+    priority_tier: int
+    target_node_id: str
+    target_name: str
+    node_kind: str
+    expected_box: dict[str, int] | None
+    actual_box: dict[str, int] | None
+    delta: dict[str, int | float | None]
+    parent_delta: dict[str, int | float | None]
+    residual_delta: dict[str, int | float | None]
+    severity_score: float
+    confidence_score: float
+    diagnosis: str
+    suggested_fix: str
+    evidence: dict[str, object]
+    suppressed_children: list[dict[str, str]] = field(default_factory=list)
+    deferred: bool = False
+    source_method: str = "node"
+    report_id: int | None = None
+
+
 def parse_args() -> argparse.Namespace:
     def hierarchy_depth(value: str) -> int:
         depth = int(value)
@@ -136,6 +220,26 @@ def parse_args() -> argparse.Namespace:
             "Named hierarchy preset: structure=1, module=3, detail=5, raw=9. "
             "--hierarchy-depth overrides this preset when both are provided."
         ),
+    )
+    parser.add_argument(
+        "--node-mode",
+        choices=("auto", "node", "pixel"),
+        default="auto",
+        help=(
+            "Decision mode. auto uses UI node diff when node inputs or screenshot proposals are "
+            "available, node requires node-first decisions, and pixel preserves legacy pixel-region "
+            "decisions. Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--expected-nodes",
+        default=None,
+        help="Optional expected/design UI node JSON. Expected boxes are normalized into actual coordinates.",
+    )
+    parser.add_argument(
+        "--actual-nodes",
+        default=None,
+        help="Optional actual/runtime UI node JSON. Boxes are interpreted in actual screenshot coordinates.",
     )
     return parser.parse_args()
 
@@ -207,6 +311,390 @@ def normalize_expected_to_actual(
         "normalized_expected_size": image_size_payload(actual_size),
         "comparison_size": image_size_payload(actual_size),
     }
+
+
+def clamp_int(value: float, lower: int, upper: int) -> int:
+    return max(lower, min(upper, int(round(value))))
+
+
+def clamp_box(
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    image_width, image_height = image_size
+    x1 = clamp_int(x, 0, image_width)
+    y1 = clamp_int(y, 0, image_height)
+    x2 = clamp_int(x + max(1.0, width), 0, image_width)
+    y2 = clamp_int(y + max(1.0, height), 0, image_height)
+    if x2 <= x1:
+        x2 = min(image_width, x1 + 1)
+    if y2 <= y1:
+        y2 = min(image_height, y1 + 1)
+    return x1, y1, x2 - x1, y2 - y1
+
+
+def box_payload(box: tuple[int, int, int, int] | None) -> dict[str, int] | None:
+    if box is None:
+        return None
+    x, y, width, height = box
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def node_box(node: UINode | None) -> tuple[int, int, int, int] | None:
+    if node is None:
+        return None
+    return node.x, node.y, node.width, node.height
+
+
+def box_center(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    x, y, width, height = box
+    return x + width / 2.0, y + height / 2.0
+
+
+def center_delta(
+    expected_box: tuple[int, int, int, int] | None,
+    actual_box: tuple[int, int, int, int] | None,
+) -> dict[str, int]:
+    if expected_box is None or actual_box is None:
+        return {"dx": 0, "dy": 0, "dw": 0, "dh": 0}
+    expected_center = box_center(expected_box)
+    actual_center = box_center(actual_box)
+    return {
+        "dx": int(round(actual_center[0] - expected_center[0])),
+        "dy": int(round(actual_center[1] - expected_center[1])),
+        "dw": actual_box[2] - expected_box[2],
+        "dh": actual_box[3] - expected_box[3],
+    }
+
+
+def normalize_node_kind(kind: object) -> str:
+    value = str(kind or "unknown").strip().lower().replace("_", "-")
+    aliases = {
+        "frame": "container",
+        "group": "container",
+        "section": "container",
+        "component": "container",
+        "instance": "container",
+        "rectangle": "container",
+        "shape": "container",
+        "vector": "icon",
+        "svg": "icon",
+        "button": "control",
+        "imageview": "image",
+        "label": "text",
+    }
+    normalized = aliases.get(value, value)
+    return normalized if normalized in NODE_KINDS else "unknown"
+
+
+def extract_bbox_payload(payload: dict[str, object]) -> tuple[float, float, float, float] | None:
+    raw_box = (
+        payload.get("bbox")
+        or payload.get("box")
+        or payload.get("frame")
+        or payload.get("absoluteBoundingBox")
+        or payload.get("absoluteRenderBounds")
+        or payload.get("bounds")
+    )
+    if isinstance(raw_box, dict):
+        if all(key in raw_box for key in BOX_KEYS):
+            return (
+                float(raw_box["x"]),
+                float(raw_box["y"]),
+                float(raw_box["width"]),
+                float(raw_box["height"]),
+            )
+        if all(key in raw_box for key in ("left", "top", "right", "bottom")):
+            left = float(raw_box["left"])
+            top = float(raw_box["top"])
+            return left, top, float(raw_box["right"]) - left, float(raw_box["bottom"]) - top
+    if isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+        return float(raw_box[0]), float(raw_box[1]), float(raw_box[2]), float(raw_box[3])
+    if all(key in payload for key in BOX_KEYS):
+        return (
+            float(payload["x"]),
+            float(payload["y"]),
+            float(payload["width"]),
+            float(payload["height"]),
+        )
+    return None
+
+
+def transform_expected_node_box(
+    box: tuple[float, float, float, float],
+    normalization: dict[str, object],
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    scale = float(normalization.get("scale", 1.0))
+    offset = normalization.get("offset", {"x": 0, "y": 0})
+    offset_x = float(offset["x"]) if isinstance(offset, dict) else 0.0
+    offset_y = float(offset["y"]) if isinstance(offset, dict) else 0.0
+    x, y, width, height = box
+    return clamp_box(
+        x * scale + offset_x,
+        y * scale + offset_y,
+        width * scale,
+        height * scale,
+        image_size,
+    )
+
+
+def node_visibility(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "hidden", "no", "off"}
+    return True
+
+
+def iter_node_payloads(
+    payload: object,
+    parent_id: str | None = None,
+    ancestors_visible: bool = True,
+) -> Iterable[tuple[dict[str, object], str | None]]:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("nodes"), list):
+            for item in payload["nodes"]:
+                yield from iter_node_payloads(item, parent_id, ancestors_visible)
+            return
+        current_visible = ancestors_visible and node_visibility(payload.get("visible", True))
+        if isinstance(payload.get("children"), list):
+            if current_visible:
+                yield payload, parent_id
+            node_id = str(payload.get("id") or payload.get("node_id") or payload.get("name") or "")
+            for child in payload["children"]:
+                yield from iter_node_payloads(child, node_id or parent_id, current_visible)
+            return
+        if current_visible:
+            yield payload, parent_id
+    elif isinstance(payload, list):
+        for item in payload:
+            yield from iter_node_payloads(item, parent_id, ancestors_visible)
+
+
+def load_ui_nodes(
+    path: Path | None,
+    image_size: tuple[int, int],
+    normalization: dict[str, object] | None,
+    source_method: str,
+) -> list[UINode]:
+    if path is None:
+        return []
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    nodes: list[UINode] = []
+    used_ids: set[str] = set()
+    raw_id_to_unique_id: dict[str, str] = {}
+    for index, (item, inherited_parent_id) in enumerate(iter_node_payloads(data), start=1):
+        if not isinstance(item, dict):
+            continue
+        bbox = extract_bbox_payload(item)
+        if bbox is None:
+            continue
+        if normalization is not None:
+            x, y, width, height = transform_expected_node_box(bbox, normalization, image_size)
+        else:
+            x, y, width, height = clamp_box(*bbox, image_size)
+        raw_id = str(item.get("id") or item.get("node_id") or item.get("name") or f"node-{index}")
+        node_id = raw_id
+        suffix = 2
+        while node_id in used_ids:
+            node_id = f"{raw_id}-{suffix}"
+            suffix += 1
+        used_ids.add(node_id)
+        parent_id = item.get("parent_id") or item.get("parentId") or inherited_parent_id
+        parent_node_id = raw_id_to_unique_id.get(str(parent_id), str(parent_id)) if parent_id else None
+        raw_id_to_unique_id[raw_id] = node_id
+        nodes.append(
+            UINode(
+                node_id=node_id,
+                parent_id=parent_node_id,
+                name=str(item.get("name") or node_id),
+                kind=normalize_node_kind(item.get("kind") or item.get("type") or item.get("role")),
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                text=str(item.get("text") or item.get("characters") or item.get("label") or ""),
+                style=item.get("style") if isinstance(item.get("style"), dict) else {},
+                visible=True,
+                confidence=float(item.get("confidence", 1.0)),
+                source_method=source_method,
+            )
+        )
+    return build_node_hierarchy(nodes, image_size, source_method)
+
+
+def build_node_hierarchy(
+    nodes: list[UINode],
+    image_size: tuple[int, int],
+    source_method: str,
+) -> list[UINode]:
+    by_id = {node.node_id: node for node in nodes}
+    for node in nodes:
+        node.children = []
+    for node in nodes:
+        if node.parent_id in by_id:
+            by_id[node.parent_id].children.append(node.node_id)
+        elif node.kind != "screen":
+            node.parent_id = "screen"
+
+    if "screen" not in by_id:
+        screen = UINode(
+            node_id="screen",
+            parent_id=None,
+            name="Screen",
+            kind="screen",
+            x=0,
+            y=0,
+            width=image_size[0],
+            height=image_size[1],
+            confidence=1.0,
+            source_method=source_method,
+        )
+        nodes.insert(0, screen)
+        by_id["screen"] = screen
+    for node in nodes:
+        if node.node_id != "screen" and node.parent_id is None:
+            node.parent_id = "screen"
+        if node.parent_id == "screen" and node.node_id not in by_id["screen"].children:
+            by_id["screen"].children.append(node.node_id)
+
+    assign_containment_parents(nodes)
+    return nodes
+
+
+def assign_containment_parents(nodes: list[UINode]) -> None:
+    by_id = {node.node_id: node for node in nodes}
+    candidates = [node for node in nodes if node.kind in {"screen", "container", "background", "control"}]
+    for node in nodes:
+        if node.node_id == "screen" or node.parent_id not in {None, "screen"}:
+            continue
+        containing = [
+            parent
+            for parent in candidates
+            if parent.node_id != node.node_id
+            and parent.bbox_area > node.bbox_area
+            and node.x >= parent.x
+            and node.y >= parent.y
+            and node.right <= parent.right
+            and node.bottom <= parent.bottom
+        ]
+        if not containing:
+            continue
+        parent = min(containing, key=lambda candidate: candidate.bbox_area)
+        if node.parent_id in by_id and node.node_id in by_id[node.parent_id].children:
+            by_id[node.parent_id].children.remove(node.node_id)
+        node.parent_id = parent.node_id
+        parent.children.append(node.node_id)
+
+
+def infer_node_kind_from_component(
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    area: int,
+    image_size: tuple[int, int],
+) -> str:
+    screen_area = image_size[0] * image_size[1]
+    bbox_area = max(1, width * height)
+    bbox_ratio = bbox_area / max(1, screen_area)
+    fill_ratio = area / bbox_area
+    aspect = width / max(1, height)
+    if bbox_ratio > 0.18:
+        return "background"
+    if bbox_ratio > 0.025 or width / max(1, image_size[0]) > 0.28:
+        return "container"
+    if max(width, height) <= 96 and 0.45 <= aspect <= 2.2 and fill_ratio >= 0.08:
+        return "icon"
+    if aspect >= 3.0 and height <= 48:
+        return "text"
+    if 0.65 <= aspect <= 1.55 and width <= 128 and height <= 128:
+        return "control"
+    return "unknown"
+
+
+def fallback_ui_nodes_from_image(
+    image_array: np.ndarray,
+    image_size: tuple[int, int],
+    source_method: str,
+    max_nodes: int = 120,
+) -> list[UINode]:
+    gray = luminance(image_array)
+    edges = sobel_magnitude(gray)
+    background = np.array(
+        [
+            image_array[0, 0],
+            image_array[0, -1],
+            image_array[-1, 0],
+            image_array[-1, -1],
+        ],
+        dtype=np.float32,
+    ).mean(axis=0)
+    color_distance = np.linalg.norm(image_array - background, axis=2)
+    edge_threshold = max(18.0, float(np.percentile(edges, 88)))
+    color_threshold = max(10.0, float(np.percentile(color_distance, 72)))
+    proposal_mask = denoise_mask((edges >= edge_threshold) | (color_distance >= color_threshold))
+    components = connected_components(proposal_mask, 12)
+
+    scored = sorted(
+        components,
+        key=lambda component: (
+            component[4],
+            (component[2] - component[0]) * (component[3] - component[1]),
+        ),
+        reverse=True,
+    )[: max_nodes * 2]
+    nodes = [
+        UINode(
+            node_id="screen",
+            parent_id=None,
+            name="Screen",
+            kind="screen",
+            x=0,
+            y=0,
+            width=image_size[0],
+            height=image_size[1],
+            confidence=1.0,
+            source_method=source_method,
+        )
+    ]
+    seen_boxes: set[tuple[int, int, int, int]] = set()
+    screen_area = image_size[0] * image_size[1]
+    for index, component in enumerate(scored, start=1):
+        x1, y1, x2, y2, area, _ = component
+        width = x2 - x1
+        height = y2 - y1
+        bbox_area = width * height
+        if width < 3 or height < 3 or bbox_area / max(1, screen_area) > 0.90:
+            continue
+        box = (x1, y1, width, height)
+        if box in seen_boxes:
+            continue
+        seen_boxes.add(box)
+        nodes.append(
+            UINode(
+                node_id=f"{source_method}-{index}",
+                parent_id="screen",
+                name=f"{source_method}-{index}",
+                kind=infer_node_kind_from_component(x1, y1, width, height, area, image_size),
+                x=x1,
+                y=y1,
+                width=width,
+                height=height,
+                confidence=0.58,
+                source_method=source_method,
+            )
+        )
+        if len(nodes) >= max_nodes:
+            break
+    return build_node_hierarchy(nodes, image_size, source_method)
 
 
 def luminance(rgb: np.ndarray) -> np.ndarray:
@@ -1478,6 +1966,691 @@ def diff_pixel_evidence(region: Region, mask: np.ndarray) -> tuple[int, dict[str
     }
 
 
+def node_payload(node: UINode) -> dict[str, object]:
+    return {
+        "id": node.node_id,
+        "parent_id": node.parent_id,
+        "name": node.name,
+        "kind": node.kind,
+        "bbox": box_payload(node_box(node)),
+        "text": node.text,
+        "style": node.style,
+        "visible": node.visible,
+        "confidence": round(node.confidence, 3),
+        "source_method": node.source_method,
+        "children": node.children,
+    }
+
+
+def bbox_distance(a: UINode, b: UINode, image_size: tuple[int, int]) -> float:
+    ac = a.center
+    bc = b.center
+    distance = math.hypot(ac[0] - bc[0], ac[1] - bc[1])
+    diagonal = math.hypot(image_size[0], image_size[1])
+    return min(1.0, distance / max(1.0, diagonal * 0.25))
+
+
+def size_difference(a: UINode, b: UINode) -> float:
+    width = abs(a.width - b.width) / max(a.width, b.width, 1)
+    height = abs(a.height - b.height) / max(a.height, b.height, 1)
+    return min(1.0, (width + height) / 2.0)
+
+
+def text_distance(a: UINode, b: UINode) -> float:
+    if not a.text and not b.text:
+        return 0.0
+    if a.text == b.text:
+        return 0.0
+    if not a.text or not b.text:
+        return 0.6
+    common = sum(1 for left, right in zip(a.text, b.text) if left == right)
+    return 1.0 - common / max(len(a.text), len(b.text), 1)
+
+
+def crop_array(
+    image_array: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> np.ndarray:
+    x, y, width, height = box
+    return image_array[y : y + height, x : x + width]
+
+
+def reduced_patch_feature(patch: np.ndarray, max_side: int = 48) -> np.ndarray:
+    if patch.size == 0:
+        return np.zeros((1, 1), dtype=np.float32)
+    gray = luminance(patch) if patch.ndim == 3 else patch.astype(np.float32)
+    stride = max(1, math.ceil(max(gray.shape) / max_side))
+    return gray[::stride, ::stride].astype(np.float32)
+
+
+def patch_distance(
+    expected_array: np.ndarray,
+    actual_array: np.ndarray,
+    expected_box: tuple[int, int, int, int],
+    actual_box: tuple[int, int, int, int],
+) -> float:
+    if expected_box[2] <= 0 or expected_box[3] <= 0 or actual_box[2] <= 0 or actual_box[3] <= 0:
+        return 1.0
+    expected_patch = crop_array(expected_array, expected_box)
+    actual_patch = crop_array(actual_array, actual_box)
+    if expected_patch.size == 0 or actual_patch.size == 0:
+        return 1.0
+    if expected_patch.shape[:2] != actual_patch.shape[:2]:
+        actual_image = Image.fromarray(np.clip(actual_patch, 0, 255).astype(np.uint8))
+        actual_patch = np.asarray(actual_image.resize((expected_patch.shape[1], expected_patch.shape[0]), resize_filter()), dtype=np.float32)
+    expected_feature = reduced_patch_feature(expected_patch)
+    actual_feature = reduced_patch_feature(actual_patch)
+    min_height = min(expected_feature.shape[0], actual_feature.shape[0])
+    min_width = min(expected_feature.shape[1], actual_feature.shape[1])
+    if min_height == 0 or min_width == 0:
+        return 1.0
+    expected_feature = expected_feature[:min_height, :min_width]
+    actual_feature = actual_feature[:min_height, :min_width]
+    gray_delta = float(np.mean(np.abs(expected_feature - actual_feature))) / 255.0
+    edge_delta_value = float(
+        np.mean(np.abs(sobel_magnitude(expected_feature) - sobel_magnitude(actual_feature)))
+    ) / 255.0
+    return min(1.0, gray_delta * 0.65 + edge_delta_value * 0.35)
+
+
+def node_match_cost(
+    expected_node: UINode,
+    actual_node: UINode,
+    expected_array: np.ndarray,
+    actual_array: np.ndarray,
+    image_size: tuple[int, int],
+    hierarchy_context_distance: float,
+) -> float:
+    visual_distance = patch_distance(
+        expected_array,
+        actual_array,
+        node_box(expected_node) or (0, 0, 1, 1),
+        node_box(actual_node) or (0, 0, 1, 1),
+    )
+    kind_mismatch = 0.0 if expected_node.kind == actual_node.kind else 1.0
+    return round(
+        0.30 * bbox_distance(expected_node, actual_node, image_size)
+        + 0.20 * size_difference(expected_node, actual_node)
+        + 0.20 * visual_distance
+        + 0.15 * text_distance(expected_node, actual_node)
+        + 0.10 * kind_mismatch
+        + 0.05 * hierarchy_context_distance,
+        4,
+    )
+
+
+def best_local_match_box(
+    expected_node: UINode,
+    expected_array: np.ndarray,
+    actual_array: np.ndarray,
+    image_size: tuple[int, int],
+) -> tuple[tuple[int, int, int, int], float]:
+    margin = 12 if expected_node.kind in {"screen", "container", "background"} else 24
+    expected_box = node_box(expected_node) or (0, 0, 1, 1)
+    x, y, width, height = expected_box
+    if width * height > image_size[0] * image_size[1] * 0.18:
+        return expected_box, 1.0
+    expected_patch = crop_array(expected_array, expected_box)
+    if expected_patch.size == 0:
+        return expected_box, 1.0
+    expected_feature = reduced_patch_feature(expected_patch)
+    if float(np.std(expected_feature)) < 3.0 and float(np.mean(sobel_magnitude(expected_feature))) < 3.0:
+        return expected_box, 1.0
+    step = 1 if max(width, height) <= 96 else 2
+    best_box = expected_box
+    best_distance = 1.0
+    for dy in range(-margin, margin + 1, step):
+        for dx in range(-margin, margin + 1, step):
+            candidate = clamp_box(x + dx, y + dy, width, height, image_size)
+            distance = patch_distance(expected_array, actual_array, expected_box, candidate)
+            if distance < best_distance:
+                best_distance = distance
+                best_box = candidate
+    return best_box, round(best_distance, 4)
+
+
+def effective_actual_box_for_match(match: NodeMatch) -> tuple[int, int, int, int] | None:
+    expected_box = node_box(match.expected_node)
+    actual_box = node_box(match.actual_node)
+    if (
+        match.status != "matched"
+        or match.expected_node is None
+        or match.expected_node.kind in {"screen", "container", "background"}
+        or expected_box is None
+        or actual_box is None
+        or match.local_box is None
+        or match.local_score is None
+        or match.local_score > 0.36
+    ):
+        return actual_box
+
+    raw_delta = center_delta(expected_box, actual_box)
+    raw_geometry_distance = max(
+        abs(raw_delta["dx"]),
+        abs(raw_delta["dy"]),
+        abs(raw_delta["dw"]),
+        abs(raw_delta["dh"]),
+    )
+    local_delta = center_delta(expected_box, match.local_box)
+    local_position_distance = max(abs(local_delta["dx"]), abs(local_delta["dy"]))
+    if raw_geometry_distance < 3 and local_position_distance >= 3:
+        return match.local_box
+    return actual_box
+
+
+def children_by_parent(nodes: list[UINode]) -> dict[str | None, list[UINode]]:
+    children: dict[str | None, list[UINode]] = {}
+    for node in nodes:
+        children.setdefault(node.parent_id, []).append(node)
+    return children
+
+
+def match_scope(
+    expected_children: list[UINode],
+    actual_children: list[UINode],
+    expected_array: np.ndarray,
+    actual_array: np.ndarray,
+    image_size: tuple[int, int],
+    hierarchy_context_distance: float,
+    match_prefix: str,
+) -> tuple[list[NodeMatch], set[str], set[str]]:
+    candidates: list[tuple[float, UINode, UINode]] = []
+    for expected_node in expected_children:
+        if expected_node.kind == "screen":
+            continue
+        for actual_node in actual_children:
+            if actual_node.kind == "screen":
+                continue
+            if (
+                bbox_distance(expected_node, actual_node, image_size) >= 0.88
+                and not (expected_node.text and expected_node.text == actual_node.text)
+            ):
+                continue
+            cost = node_match_cost(
+                expected_node,
+                actual_node,
+                expected_array,
+                actual_array,
+                image_size,
+                hierarchy_context_distance,
+            )
+            if expected_node.kind == actual_node.kind or cost <= 0.52:
+                candidates.append((cost, expected_node, actual_node))
+
+    candidates.sort(key=lambda item: (item[0], item[1].node_id, item[2].node_id))
+    matches: list[NodeMatch] = []
+    used_expected: set[str] = set()
+    used_actual: set[str] = set()
+    for cost, expected_node, actual_node in candidates:
+        if expected_node.node_id in used_expected or actual_node.node_id in used_actual:
+            continue
+        if cost > 0.74:
+            continue
+        local_box, local_score = best_local_match_box(
+            expected_node,
+            expected_array,
+            actual_array,
+            image_size,
+        )
+        match = NodeMatch(
+            match_id=f"{match_prefix}-{len(matches) + 1}",
+            expected_node=expected_node,
+            actual_node=actual_node,
+            status="matched",
+            cost=cost,
+            local_box=local_box,
+            local_score=local_score,
+        )
+        match.delta = center_delta(node_box(expected_node), effective_actual_box_for_match(match))
+        used_expected.add(expected_node.node_id)
+        used_actual.add(actual_node.node_id)
+        matches.append(match)
+    return matches, used_expected, used_actual
+
+
+def match_ui_nodes(
+    expected_nodes: list[UINode],
+    actual_nodes: list[UINode],
+    expected_array: np.ndarray,
+    actual_array: np.ndarray,
+    image_size: tuple[int, int],
+) -> list[NodeMatch]:
+    expected_by_id = {node.node_id: node for node in expected_nodes}
+    actual_by_id = {node.node_id: node for node in actual_nodes}
+    expected_children = children_by_parent(expected_nodes)
+    actual_children = children_by_parent(actual_nodes)
+    matches: list[NodeMatch] = []
+    matched_expected: set[str] = set()
+    matched_actual: set[str] = set()
+
+    if "screen" in expected_by_id and "screen" in actual_by_id:
+        screen_match = NodeMatch(
+            match_id="screen",
+            expected_node=expected_by_id["screen"],
+            actual_node=actual_by_id["screen"],
+            status="matched",
+            cost=0.0,
+            delta=center_delta(node_box(expected_by_id["screen"]), node_box(actual_by_id["screen"])),
+        )
+        matches.append(screen_match)
+        matched_expected.add("screen")
+        matched_actual.add("screen")
+
+    scopes = [("screen", "screen")]
+    visited_scopes: set[tuple[str, str]] = set()
+    while scopes:
+        expected_parent_id, actual_parent_id = scopes.pop(0)
+        if (expected_parent_id, actual_parent_id) in visited_scopes:
+            continue
+        visited_scopes.add((expected_parent_id, actual_parent_id))
+        scope_matches, used_expected, used_actual = match_scope(
+            [node for node in expected_children.get(expected_parent_id, []) if node.node_id not in matched_expected],
+            [node for node in actual_children.get(actual_parent_id, []) if node.node_id not in matched_actual],
+            expected_array,
+            actual_array,
+            image_size,
+            0.0,
+            f"scope-{len(visited_scopes)}",
+        )
+        matches.extend(scope_matches)
+        matched_expected |= used_expected
+        matched_actual |= used_actual
+        for match in scope_matches:
+            if match.expected_node and match.actual_node:
+                scopes.append((match.expected_node.node_id, match.actual_node.node_id))
+
+    remaining_expected = [node for node in expected_nodes if node.node_id not in matched_expected]
+    remaining_actual = [node for node in actual_nodes if node.node_id not in matched_actual]
+    fallback_matches, used_expected, used_actual = match_scope(
+        remaining_expected,
+        remaining_actual,
+        expected_array,
+        actual_array,
+        image_size,
+        1.0,
+        "global",
+    )
+    matches.extend(fallback_matches)
+    matched_expected |= used_expected
+    matched_actual |= used_actual
+
+    for node in expected_nodes:
+        if node.node_id not in matched_expected and node.kind != "screen":
+            matches.append(
+                NodeMatch(
+                    match_id=f"missing-{node.node_id}",
+                    expected_node=node,
+                    actual_node=None,
+                    status="missing",
+                    cost=1.0,
+                )
+            )
+    for node in actual_nodes:
+        if node.node_id not in matched_actual and node.kind != "screen":
+            matches.append(
+                NodeMatch(
+                    match_id=f"extra-{node.node_id}",
+                    expected_node=None,
+                    actual_node=node,
+                    status="extra",
+                    cost=1.0,
+                )
+            )
+    return matches
+
+
+def category_tier(category: str) -> int:
+    order = {
+        "size / layout dimensions": 1,
+        "position / alignment": 2,
+        "relative relationship / spacing": 3,
+        "missing element": 4,
+        "extra element": 4,
+        "image / icon consistency": 4,
+        "font metrics / typography": 5,
+        "foreground color": 6,
+        "background color": 7,
+        "gradient": 8,
+        "shadow / effect": 9,
+    }
+    return order.get(category, 9)
+
+
+def issue_category_for_node(
+    node: UINode,
+    delta: dict[str, int],
+    residual: dict[str, int],
+) -> str | None:
+    size_delta = max(abs(delta["dw"]), abs(delta["dh"]))
+    size_ratio = max(
+        abs(delta["dw"]) / max(node.width, 1),
+        abs(delta["dh"]) / max(node.height, 1),
+    )
+    residual_distance = max(abs(residual["dx"]), abs(residual["dy"]))
+    if size_delta >= 3 or size_ratio >= 0.03:
+        return "size / layout dimensions"
+    if residual_distance >= 3:
+        return "position / alignment"
+    return None
+
+
+def issue_severity(category: str, delta: dict[str, int], node: UINode | None, cost: float) -> float:
+    distance = max(abs(delta.get("dx", 0)), abs(delta.get("dy", 0)), abs(delta.get("dw", 0)), abs(delta.get("dh", 0)))
+    size_factor = min(1.0, distance / 24.0)
+    area_factor = 0.0
+    if node is not None:
+        area_factor = min(1.0, math.sqrt(node.bbox_area) / 220.0)
+    base = {
+        "missing element": 74.0,
+        "extra element": 66.0,
+        "size / layout dimensions": 58.0,
+        "position / alignment": 52.0,
+        "image / icon consistency": 48.0,
+        "font metrics / typography": 46.0,
+        "background color": 22.0,
+    }.get(category, 35.0)
+    return round(min(100.0, base + size_factor * 28.0 + area_factor * 10.0 + max(0.0, 1.0 - cost) * 4.0), 2)
+
+
+def issue_confidence(match: NodeMatch, source_method: str) -> float:
+    base = 0.82 if "json" in source_method or "nodes" in source_method else 0.58
+    if match.status == "matched":
+        base += max(0.0, 0.18 * (1.0 - match.cost))
+    if match.local_score is not None:
+        base += max(0.0, 0.10 * (1.0 - match.local_score))
+    return round(max(0.1, min(0.98, base)), 3)
+
+
+def issue_text(
+    issue_type: str,
+    category: str,
+    node: UINode,
+    delta: dict[str, int],
+    residual: dict[str, int],
+    parent_delta: dict[str, int],
+) -> tuple[str, str]:
+    name = node.name or node.node_id
+    if issue_type == "missing":
+        return (
+            f"{name} is present in the expected design but no matching runtime node was found.",
+            "Add or reveal the missing UI element, or check conditional rendering for this state.",
+        )
+    if issue_type == "extra":
+        return (
+            f"{name} appears in the runtime UI but no matching expected design node was found.",
+            "Remove the extra UI element or confirm the design reference includes this state.",
+        )
+    if category == "size / layout dimensions":
+        return (
+            f"{name} has size delta dw={delta['dw']}px, dh={delta['dh']}px versus the expected node.",
+            "Adjust width, height, padding, or layout constraints for this node.",
+        )
+    return (
+        f"{name} has residual position delta dx={residual['dx']}px, dy={residual['dy']}px after parent delta dx={parent_delta['dx']}px, dy={parent_delta['dy']}px.",
+        "Adjust this node's alignment, offset, padding, gap, or local layout constraints.",
+    )
+
+
+def diagnose_node_issues(
+    matches: list[NodeMatch],
+    signals: DiffSignals,
+    image_size: tuple[int, int],
+) -> tuple[list[UIIssue], list[UIIssue]]:
+    matched_by_expected = {
+        match.expected_node.node_id: match
+        for match in matches
+        if match.status == "matched" and match.expected_node is not None
+    }
+    issues: list[UIIssue] = []
+    issue_index = 1
+
+    for match in matches:
+        node = match.expected_node or match.actual_node
+        if node is None or node.kind == "screen":
+            continue
+        expected_box = node_box(match.expected_node)
+        actual_node_box = node_box(match.actual_node)
+        actual_box = effective_actual_box_for_match(match)
+        if match.status == "missing":
+            category = "missing element"
+            delta = {"dx": None, "dy": None, "dw": None, "dh": None}
+            parent_delta = {"dx": 0, "dy": 0, "dw": 0, "dh": 0}
+            residual = parent_delta
+        elif match.status == "extra":
+            category = "extra element"
+            delta = {"dx": None, "dy": None, "dw": None, "dh": None}
+            parent_delta = {"dx": 0, "dy": 0, "dw": 0, "dh": 0}
+            residual = parent_delta
+        else:
+            delta = center_delta(expected_box, actual_box)
+            parent_match = (
+                matched_by_expected.get(match.expected_node.parent_id)
+                if match.expected_node and match.expected_node.parent_id
+                else None
+            )
+            parent_delta = (
+                center_delta(node_box(parent_match.expected_node), effective_actual_box_for_match(parent_match))
+                if parent_match
+                else {"dx": 0, "dy": 0, "dw": 0, "dh": 0}
+            )
+            residual = {
+                "dx": int(delta["dx"] - parent_delta["dx"]),
+                "dy": int(delta["dy"] - parent_delta["dy"]),
+                "dw": int(delta["dw"]),
+                "dh": int(delta["dh"]),
+            }
+            match.delta = delta
+            match.parent_delta = parent_delta
+            match.residual_delta = residual
+            category = issue_category_for_node(node, delta, residual)
+            if category is None:
+                continue
+
+        diagnosis, suggested_fix = issue_text(
+            match.status,
+            category,
+            node,
+            {key: int(value or 0) for key, value in delta.items()},
+            {key: int(value or 0) for key, value in residual.items()},
+            {key: int(value or 0) for key, value in parent_delta.items()},
+        )
+        evidence_region = Region(
+            region_id=0,
+            x=(actual_box or expected_box or (0, 0, 1, 1))[0],
+            y=(actual_box or expected_box or (0, 0, 1, 1))[1],
+            width=(actual_box or expected_box or (0, 0, 1, 1))[2],
+            height=(actual_box or expected_box or (0, 0, 1, 1))[3],
+            area=max(1, (actual_box or expected_box or (0, 0, 1, 1))[2] * (actual_box or expected_box or (0, 0, 1, 1))[3]),
+            mean_delta=0.0,
+            max_delta=0.0,
+            category_hint=category,
+        )
+        diff_count, diff_bbox = diff_pixel_evidence(evidence_region, signals.combined_mask)
+        source_method = node.source_method
+        issue = UIIssue(
+            issue_id=f"I-{issue_index:03d}",
+            issue_type=match.status if match.status != "matched" else "node_diff",
+            category=category,
+            priority_tier=category_tier(category),
+            target_node_id=node.node_id,
+            target_name=node.name,
+            node_kind=node.kind,
+            expected_box=box_payload(expected_box),
+            actual_box=box_payload(actual_box),
+            delta=delta,
+            parent_delta=parent_delta,
+            residual_delta=residual,
+            severity_score=issue_severity(category, {key: int(value or 0) for key, value in delta.items()}, node, match.cost),
+            confidence_score=issue_confidence(match, source_method),
+            diagnosis=diagnosis,
+            suggested_fix=suggested_fix,
+            evidence={
+                "match_cost": match.cost,
+                "node_actual_box": box_payload(actual_node_box),
+                "local_search_box": box_payload(match.local_box),
+                "local_search_score": match.local_score,
+                "diff_pixel_count": diff_count,
+                "diff_pixel_bbox": diff_bbox,
+                "pixel_diff_is_evidence_only": True,
+            },
+            source_method=source_method,
+        )
+        issues.append(issue)
+        issue_index += 1
+
+    by_target = {issue.target_node_id: issue for issue in issues}
+    for match in matches:
+        if match.status != "matched" or match.expected_node is None:
+            continue
+        parent_issue = by_target.get(match.expected_node.parent_id or "")
+        if parent_issue is None or match.expected_node.node_id == parent_issue.target_node_id:
+            continue
+        residual = match.residual_delta or {"dx": 0, "dy": 0}
+        if max(abs(int(residual.get("dx", 0))), abs(int(residual.get("dy", 0)))) < 3:
+            parent_issue.suppressed_children.append(
+                {
+                    "node": match.expected_node.node_id,
+                    "reason": f"same common parent offset as {parent_issue.target_node_id}",
+                }
+            )
+
+    actionable = [issue for issue in issues if not issue.deferred and issue.priority_tier <= 6]
+    deferred = [issue for issue in issues if issue.deferred or issue.priority_tier >= 7]
+    actionable.sort(key=lambda issue: (issue.priority_tier, -issue.severity_score, issue.target_name))
+    deferred.sort(key=lambda issue: (issue.priority_tier, -issue.severity_score, issue.target_name))
+    for report_id, issue in enumerate([*actionable, *deferred], start=1):
+        issue.report_id = report_id
+    return actionable, deferred
+
+
+def deferred_background_issues_from_pixels(
+    pixel_regions: list[Region],
+    signals: DiffSignals,
+    image_size: tuple[int, int],
+    start_index: int,
+) -> list[UIIssue]:
+    deferred: list[UIIssue] = []
+    screen_area = image_size[0] * image_size[1]
+    for region in pixel_regions:
+        area_ratio = region.bbox_area / max(1, screen_area)
+        edge_count = region.signal_counts.get("edge", 0)
+        structure_mean = region.signal_strengths.get("structure_dissimilarity", 0.0)
+        color_mean = region.signal_strengths.get("color_delta_e", 0.0)
+        edge_density = edge_count / max(1, region.area)
+        if not (
+            area_ratio > 0.18
+            and color_mean > signals.thresholds["color_delta_e"]
+            and edge_density < 0.025
+            and structure_mean < 0.08
+        ):
+            continue
+        box = {"x": region.x, "y": region.y, "width": region.width, "height": region.height}
+        deferred.append(
+            UIIssue(
+                issue_id=f"I-{start_index + len(deferred):03d}",
+                issue_type="deferred_style",
+                category="background color",
+                priority_tier=7,
+                target_node_id=f"pixel-region-{region.region_id}",
+                target_name=f"Pixel region {region.region_id}",
+                node_kind="background",
+                expected_box=box,
+                actual_box=box,
+                delta={"dx": 0, "dy": 0, "dw": 0, "dh": 0},
+                parent_delta={"dx": 0, "dy": 0, "dw": 0, "dh": 0},
+                residual_delta={"dx": 0, "dy": 0, "dw": 0, "dh": 0},
+                severity_score=min(40.0, region.severity_score),
+                confidence_score=region.confidence_score,
+                diagnosis="Large low-frequency color difference is treated as deferred visual style evidence.",
+                suggested_fix="Check background fill, gradient, opacity, or shadow only after actionable layout/text/icon issues are handled.",
+                evidence={
+                    "source_region_id": region.region_id,
+                    "area_ratio": round(area_ratio, 4),
+                    "edge_density": round(edge_density, 5),
+                    "structure_mean": structure_mean,
+                    "color_mean": color_mean,
+                    "pixel_diff_is_evidence_only": True,
+                },
+                deferred=True,
+                source_method="pixel-evidence",
+            )
+        )
+    return deferred[:1]
+
+
+def issue_payload(issue: UIIssue) -> dict[str, object]:
+    return {
+        "issue_id": issue.issue_id,
+        "report_id": issue.report_id,
+        "issue_type": issue.issue_type,
+        "target": {
+            "id": issue.target_node_id,
+            "name": issue.target_name,
+            "kind": issue.node_kind,
+            "box_expected": issue.expected_box,
+            "box_actual": issue.actual_box,
+        },
+        "category": issue.category,
+        "priority_tier": issue.priority_tier,
+        "severity_score": issue.severity_score,
+        "confidence": {
+            "score": issue.confidence_score,
+            "level": "high" if issue.confidence_score >= 0.72 else "medium" if issue.confidence_score >= 0.5 else "low",
+        },
+        "delta": issue.delta,
+        "parent_delta": issue.parent_delta,
+        "residual_delta": issue.residual_delta,
+        "diagnosis": issue.diagnosis,
+        "suggested_fix": issue.suggested_fix,
+        "evidence": issue.evidence,
+        "suppressed_children": issue.suppressed_children,
+        "deferred": issue.deferred,
+        "source_method": issue.source_method,
+    }
+
+
+def issue_to_region(issue: UIIssue, region_id: int) -> Region:
+    box = issue.actual_box or issue.expected_box or {"x": 0, "y": 0, "width": 1, "height": 1}
+    region = Region(
+        region_id=region_id,
+        x=int(box["x"]),
+        y=int(box["y"]),
+        width=max(1, int(box["width"])),
+        height=max(1, int(box["height"])),
+        area=max(1, int(box["width"]) * int(box["height"])),
+        mean_delta=0.0,
+        max_delta=0.0,
+        category_hint=issue.category,
+        level=2 if issue.node_kind in {"container", "background"} else 3,
+        priority=issue.severity_score,
+        display_depth=3 if issue.priority_tier <= 3 else 5,
+        report_id=issue.report_id,
+        element_kind=f"{issue.node_kind} node",
+        severity_score=issue.severity_score,
+        confidence_score=issue.confidence_score,
+        confidence_level="high" if issue.confidence_score >= 0.72 else "medium" if issue.confidence_score >= 0.5 else "low",
+        priority_category=issue.category,
+        priority_tier=issue.priority_tier,
+        report_group=issue.issue_id,
+    )
+    return region
+
+
+def match_payload(match: NodeMatch) -> dict[str, object]:
+    return {
+        "id": match.match_id,
+        "status": match.status,
+        "cost": match.cost,
+        "expected_node_id": match.expected_node.node_id if match.expected_node else None,
+        "actual_node_id": match.actual_node.node_id if match.actual_node else None,
+        "delta": match.delta,
+        "parent_delta": match.parent_delta,
+        "residual_delta": match.residual_delta,
+        "local_box": box_payload(match.local_box),
+        "local_score": match.local_score,
+    }
+
+
 def hierarchy_policy_text(
     hierarchy_depth: int | None,
     report_mode: str | None,
@@ -1541,6 +2714,14 @@ def save_regions(
     regions: list[Region],
     reported_regions: list[Region],
     suppressed_regions: list[Region],
+    node_mode: str = "auto",
+    expected_nodes: list[UINode] | None = None,
+    actual_nodes: list[UINode] | None = None,
+    node_matches: list[NodeMatch] | None = None,
+    issues: list[UIIssue] | None = None,
+    actionable_issues: list[UIIssue] | None = None,
+    deferred_visual_issues: list[UIIssue] | None = None,
+    raw_pixel_regions: list[Region] | None = None,
 ) -> None:
     artifacts = {
         "annotated_actual": str(out_dir / "annotated_actual.png"),
@@ -1565,6 +2746,7 @@ def save_regions(
             child_counts[suppressed_region.suppressed_by] = (
                 child_counts.get(suppressed_region.suppressed_by, 0) + 1
             )
+    issue_by_id = {issue.issue_id: issue for issue in (issues or [])}
 
     def region_payload(region: Region) -> dict[str, object]:
         child_count = child_counts.get(region.region_id, 0)
@@ -1619,6 +2801,9 @@ def save_regions(
                 "diff_pixel_bbox": diff_pixel_bbox,
                 "region_crops": crop_artifacts.get(region.region_id),
             },
+            "issue": issue_payload(issue_by_id[region.report_group])
+            if region.report_group in issue_by_id
+            else None,
         }
 
     payload = {
@@ -1640,13 +2825,19 @@ def save_regions(
             "rasterization-only noise",
         ],
         "diff_engine": {
-            "mode": "multi-signal",
+            "mode": "node-first" if node_mode != "pixel" else "multi-signal",
             "signals": [
                 "rgb pixel distance",
                 "CIE Lab perceptual color distance",
                 "local structural dissimilarity",
                 "Sobel edge/stroke delta",
             ],
+            "decision_policy": (
+                "UI node matching and hierarchical attribution produce primary issues; "
+                "pixel diff channels are evidence/debug inputs."
+                if node_mode != "pixel"
+                else "Legacy pixel-region hierarchy produces primary regions."
+            ),
             "thresholds": signals.thresholds,
             "priority_order": [
                 "1 size / layout dimensions",
@@ -1682,8 +2873,33 @@ def save_regions(
             "hierarchy_depth": hierarchy_depth,
             "report_mode": report_mode,
             "effective_hierarchy_depth": effective_depth,
+            "node_mode": node_mode,
             "signal_thresholds": signals.thresholds,
         },
+        "ui_nodes": {
+            "expected": [node_payload(node) for node in (expected_nodes or [])],
+            "actual": [node_payload(node) for node in (actual_nodes or [])],
+            "schema": {
+                "fields": [
+                    "id",
+                    "parent_id",
+                    "name",
+                    "kind",
+                    "bbox",
+                    "text",
+                    "style",
+                    "visible",
+                    "confidence",
+                    "source_method",
+                    "children",
+                ],
+                "kinds": sorted(NODE_KINDS),
+            },
+        },
+        "node_matches": [match_payload(match) for match in (node_matches or [])],
+        "issues": [issue_payload(issue) for issue in (issues or [])],
+        "actionable_issues": [issue_payload(issue) for issue in (actionable_issues or [])],
+        "deferred_visual_issues": [issue_payload(issue) for issue in (deferred_visual_issues or [])],
         "regions": [region_payload(region) for region in regions],
         "reported_regions": [region_payload(region) for region in reported_regions],
         "suppressed_regions": [region_payload(region) for region in suppressed_regions],
@@ -1706,7 +2922,8 @@ def save_regions(
             for region in reported_regions
             if 4 <= region.display_depth <= 8
         ],
-        "raw_regions": [region_payload(region) for region in regions],
+        "raw_regions": [region_payload(region) for region in (raw_pixel_regions or regions)],
+        "raw_pixel_regions": [region_payload(region) for region in (raw_pixel_regions or [])],
     }
     (out_dir / "regions.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
@@ -1716,6 +2933,8 @@ def main() -> int:
     effective_depth = effective_hierarchy_depth(args.hierarchy_depth, args.report_mode)
     actual_path = Path(args.actual).expanduser().resolve()
     expected_path = Path(args.expected).expanduser().resolve()
+    expected_nodes_path = Path(args.expected_nodes).expanduser().resolve() if args.expected_nodes else None
+    actual_nodes_path = Path(args.actual_nodes).expanduser().resolve() if args.actual_nodes else None
     out_dir = Path(args.out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1741,12 +2960,75 @@ def main() -> int:
             *detail_components,
         ]
     )
-    regions = make_regions(merged, signals, args.max_regions)
-    regions, reported_regions, suppressed_regions = apply_hierarchy(
-        regions,
+    raw_pixel_regions = make_regions(merged, signals, args.max_regions)
+    raw_pixel_regions, pixel_reported_regions, pixel_suppressed_regions = apply_hierarchy(
+        raw_pixel_regions,
         actual_image.size,
         effective_depth,
     )
+    expected_nodes: list[UINode] = []
+    actual_nodes: list[UINode] = []
+    node_matches: list[NodeMatch] = []
+    actionable_issues: list[UIIssue] = []
+    deferred_visual_issues: list[UIIssue] = []
+    issues: list[UIIssue] = []
+
+    if args.node_mode != "pixel":
+        expected_nodes = load_ui_nodes(
+            expected_nodes_path,
+            actual_image.size,
+            normalization,
+            "expected-node-json",
+        ) if expected_nodes_path else fallback_ui_nodes_from_image(
+            expected_array,
+            actual_image.size,
+            "expected-screenshot-parser",
+        )
+        actual_nodes = load_ui_nodes(
+            actual_nodes_path,
+            actual_image.size,
+            None,
+            "actual-node-json",
+        ) if actual_nodes_path else fallback_ui_nodes_from_image(
+            actual_array,
+            actual_image.size,
+            "actual-screenshot-parser",
+        )
+        node_matches = match_ui_nodes(
+            expected_nodes,
+            actual_nodes,
+            expected_array,
+            actual_array,
+            actual_image.size,
+        )
+        actionable_issues, deferred_visual_issues = diagnose_node_issues(
+            node_matches,
+            signals,
+            actual_image.size,
+        )
+        deferred_visual_issues.extend(
+            deferred_background_issues_from_pixels(
+                raw_pixel_regions,
+                signals,
+                actual_image.size,
+                start_index=len(actionable_issues) + len(deferred_visual_issues) + 1,
+            )
+        )
+        for report_id, issue in enumerate([*actionable_issues, *deferred_visual_issues], start=1):
+            issue.report_id = report_id
+        issues = [*actionable_issues, *deferred_visual_issues]
+
+    if args.node_mode == "pixel" or (args.node_mode == "auto" and not issues and len(expected_nodes) <= 1 and len(actual_nodes) <= 1):
+        regions = raw_pixel_regions
+        reported_regions = pixel_reported_regions
+        suppressed_regions = pixel_suppressed_regions
+        active_node_mode = "pixel"
+    else:
+        marker_issues = (actionable_issues if actionable_issues else deferred_visual_issues)[: args.max_regions]
+        regions = [issue_to_region(issue, index) for index, issue in enumerate(marker_issues, start=1)]
+        reported_regions = regions
+        suppressed_regions = []
+        active_node_mode = args.node_mode
 
     evidence_mask = evidence_mask_for_regions(mask, reported_regions)
     crop_artifacts = save_region_crops(
@@ -1759,8 +3041,8 @@ def main() -> int:
     )
     annotated = draw_annotations(actual_image, reported_regions)
     annotated_expected = draw_annotations(expected_image, reported_regions)
-    annotated_raw = draw_annotations(actual_image, regions)
-    annotated_raw_expected = draw_annotations(expected_image, regions)
+    annotated_raw = draw_annotations(actual_image, raw_pixel_regions)
+    annotated_raw_expected = draw_annotations(expected_image, raw_pixel_regions)
     focus_regions = focus_regions_for_depth(reported_regions, effective_depth)
     annotated_depth = draw_annotations(actual_image, focus_regions)
     annotated_depth_expected = draw_annotations(expected_image, focus_regions)
@@ -1805,12 +3087,20 @@ def main() -> int:
         regions=regions,
         reported_regions=reported_regions,
         suppressed_regions=suppressed_regions,
+        node_mode=active_node_mode,
+        expected_nodes=expected_nodes,
+        actual_nodes=actual_nodes,
+        node_matches=node_matches,
+        issues=issues,
+        actionable_issues=actionable_issues,
+        deferred_visual_issues=deferred_visual_issues,
+        raw_pixel_regions=raw_pixel_regions,
     )
 
     print(
         f"Wrote {len(reported_regions)} reported region(s), "
         f"{len(suppressed_regions)} suppressed region(s), "
-        f"{len(regions)} raw region(s) to {out_dir}"
+        f"{len(raw_pixel_regions)} raw pixel region(s) to {out_dir}"
     )
     print(f"- {out_dir / 'annotated_actual.png'}")
     print(f"- {out_dir / 'annotated_expected.png'}")

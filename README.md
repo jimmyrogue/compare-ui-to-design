@@ -109,15 +109,15 @@ Outputs:
 - `report/region_crops/`
 - `report/regions.json`
 
-The diff engine is multi-signal. It combines RGB pixel distance, CIE Lab perceptual color distance, local structural dissimilarity, and Sobel edge/stroke delta before building candidate regions. This catches subtle color, border, icon, and typography-metric differences that a single RGB threshold can miss.
+The default engine is node-first. It compares UI nodes and their hierarchy first, then uses RGB pixel distance, CIE Lab perceptual color distance, local structural dissimilarity, and Sobel edge/stroke delta as evidence. If node JSON is available, pass it with `--expected-nodes` and `--actual-nodes`; otherwise the CLI falls back to lightweight screenshot node proposals.
 
-`regions.json` contains numbered regions with `x`, `y`, `width`, `height`, `area`, `mean_delta`, `max_delta`, `display_depth`, `audit_focus`, `ignored_by_default`, a UI/UX category hint, `priority_tier`, `priority_category`, `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`. Treat the hints as review aids; the final report should merge raw pixel regions into meaningful module-level UI findings.
+`regions.json` contains issue-centered fields: `issues`, `actionable_issues`, `deferred_visual_issues`, `ui_nodes`, `node_matches`, and `raw_pixel_regions`. `reported_regions` and `focus_regions` remain for annotation compatibility, but they are issue-backed marker boxes. Pixel regions are kept as evidence/debug data, not the main decision layer.
 
 Report order is intentionally geometry-first: size/layout dimensions, position/alignment, relative relationship/spacing, image/icon consistency, font metrics/typography, foreground color, background color, gradient, then shadow/effects. `--report-mode detail` includes tiers 1-5 by default, so color-only backgrounds and decorative effects do not dominate the marked screenshot.
 
-The JSON also includes `audit_order: "top-down"`, `reported_regions`, `depth_regions`, `parent_regions`, `detail_regions`, `raw_regions`, and `suppressed_regions`. Use `reported_regions` for the main audit. In drilldown mode, `depth_regions` mirrors the selected preset/depth, `parent_regions` keeps page/module context, `detail_regions` isolates child findings, and `raw_regions` keeps every raw candidate for debugging.
+The JSON also includes `audit_order: "top-down"`, `reported_regions`, `depth_regions`, `parent_regions`, `detail_regions`, `raw_regions`, and `suppressed_regions`. Use `actionable_issues` for the main audit and `deferred_visual_issues` for background/color/gradient/shadow differences that should not outrank layout, text, or icon problems.
 
-Use `--report-mode structure|module|detail|raw` to drill into deeper layers while keeping top-down context. The default command preserves the classic parent-first report. `--hierarchy-depth 1..9` is the advanced numeric form and overrides the preset when both are provided. A practical sequence is:
+Use `--node-mode pixel` to run the legacy pixel-region decision path. Use `--report-mode structure|module|detail|raw` to drill into deeper layers while keeping top-down context. `--hierarchy-depth 1..9` is the advanced numeric form and overrides the preset when both are provided. A practical sequence is:
 
 ```bash
 python skills/compare-ui-to-design/scripts/visual_diff.py \
@@ -134,7 +134,7 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 
 Reported regions can include `finding_summary`, `review_guidance`, `edge_evidence`, and `suppressed_child_count`. Agents should use those fields directly as script evidence. A broad parent/module region is not a false positive just because it covers many child diffs; for example, `edge_evidence.margins.right = 0` means the actual app-owned region reaches the right screenshot edge and must be checked for missing side gutter, safe-area padding, or clipping against the design.
 
-Each run also returns paired visual evidence. `annotated_actual.png` and `annotated_expected.png` use the same marker numbers and coordinates, so agents can compare the actual and design views directly. `annotated_depth_*` shows the selected drilldown layer, and `annotated_raw_*` shows every raw candidate region. When source sizes differ, `annotated_expected.png` is the normalized design image in the actual screenshot coordinate space; `regions.json.normalization` records the original design size, scale, offset, padding, and `cropped: false`. `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, `diff_graymap.png`, `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` show the finer changed-pixel evidence that supports broad parent/module findings without turning those pixels into extra report rows. `region_crops/` contains paired actual/design/diff crops for reported markers and is the fastest way to verify the exact visual property before writing the audit.
+Each run also returns paired visual evidence. `annotated_actual.png` and `annotated_expected.png` use the same marker numbers and coordinates, so agents can compare the actual and design views directly. `annotated_depth_*` shows the selected drilldown layer, and `annotated_raw_*` shows every raw pixel-evidence candidate. When source sizes differ, `annotated_expected.png` is the normalized design image in the actual screenshot coordinate space; `regions.json.normalization` records the original design size, scale, offset, padding, and `cropped: false`. `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, `diff_graymap.png`, `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` show the finer changed-pixel evidence that supports node-level issues without turning those pixels into extra report rows. `region_crops/` contains paired actual/design/diff crops for reported markers and is the fastest way to verify the exact visual property before writing the audit.
 
 ## Project Layout
 
@@ -302,15 +302,15 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 - `report/region_crops/`
 - `report/regions.json`
 
-diff 引擎现在是多信号模式：先综合 RGB 像素距离、CIE Lab 感知色差、局部结构差异和 Sobel 边缘/描边差异，再生成候选区域。这样可以抓到单一 RGB 阈值容易漏掉的微妙颜色、边框、图标和字体指标差异。
+默认引擎现在是 node-first：先比较 UI 节点和层级关系，再把 RGB 像素距离、CIE Lab 感知色差、局部结构差异和 Sobel 边缘/描边差异作为证据。已有节点树时，用 `--expected-nodes` 和 `--actual-nodes` 传入；没有节点树时，CLI 会回退到轻量截图节点候选。
 
-`regions.json` 会包含编号区域、`x`、`y`、`width`、`height`、`area`、`mean_delta`、`max_delta`、`display_depth`、`audit_focus`、`ignored_by_default`、UI/UX 分类提示、`priority_tier`、`priority_category`、`element_kind`、`severity_score`、`confidence`、`dominant_signal` 和 `diff_signals`。分类提示只是辅助，最终报告应该把像素级 diff 合并成有意义的模块级 UI 问题。
+`regions.json` 会包含 issue-centered 字段：`issues`、`actionable_issues`、`deferred_visual_issues`、`ui_nodes`、`node_matches` 和 `raw_pixel_regions`。`reported_regions` 和 `focus_regions` 仍然保留，用于兼容标注图，但它们是 issue-backed marker boxes。像素区域只作为 evidence/debug 数据，不再作为主决策层。
 
 报告顺序会优先看几何和结构：尺寸/布局、位置/对齐、相对关系/间距、图片/icon 一致性、字体指标/排版、前景色、背景色、渐变、阴影/效果。`--report-mode detail` 默认只包含 1-5 层，所以纯背景色和装饰效果不会主导标注截图。
 
-JSON 还会包含 `audit_order: "top-down"`、`reported_regions`、`depth_regions`、`parent_regions`、`detail_regions`、`raw_regions` 和 `suppressed_regions`。主报告应优先使用 `reported_regions`。在钻取模式下，`depth_regions` 对应当前 preset/depth，`parent_regions` 保留页面/模块上下文，`detail_regions` 聚焦子级细节，`raw_regions` 保留所有原始候选区域用于调试。
+JSON 还会包含 `audit_order: "top-down"`、`reported_regions`、`depth_regions`、`parent_regions`、`detail_regions`、`raw_regions` 和 `suppressed_regions`。主报告应优先使用 `actionable_issues`，背景色、渐变、阴影等低优先级视觉差异放在 `deferred_visual_issues`。
 
-使用 `--report-mode structure|module|detail|raw` 可以在保留 top-down 上下文的同时继续向细节层钻取。默认命令保持原来的父级优先报告。`--hierarchy-depth 1..9` 是高级数字形式；如果 preset 和数字同时传入，数字优先。常用命令：
+使用 `--node-mode pixel` 可以运行旧的 pixel-region 决策路径。使用 `--report-mode structure|module|detail|raw` 可以在保留 top-down 上下文的同时继续向细节层钻取。`--hierarchy-depth 1..9` 是高级数字形式；如果 preset 和数字同时传入，数字优先。常用命令：
 
 ```bash
 python skills/compare-ui-to-design/scripts/visual_diff.py \
@@ -327,7 +327,7 @@ python skills/compare-ui-to-design/scripts/visual_diff.py \
 
 `reported_regions` 可能包含 `finding_summary`、`review_guidance`、`edge_evidence` 和 `suppressed_child_count`。Agent 应该把这些字段当作脚本证据直接使用。一个较大的父级/模块区域不应该因为覆盖了很多子级 diff 就被当成误报；例如 `edge_evidence.margins.right = 0` 表示实际 app 区域已经贴到截图右边缘，应该检查是否缺少右侧 gutter、安全区 padding，或者是否发生裁切。
 
-每次运行还会返回成对的视觉证据。`annotated_actual.png` 和 `annotated_expected.png` 使用相同编号和坐标，方便 agent 直接对照实际图与设计稿。`annotated_depth_*` 展示当前选择的钻取层级，`annotated_raw_*` 展示所有原始候选区域。当源图尺寸不一致时，`annotated_expected.png` 是已经归一化到实际截图坐标系的设计稿；`regions.json.normalization` 会记录原始设计稿尺寸、缩放比例、offset、padding，以及 `cropped: false`。`evidence_overlay_actual.png`、`evidence_overlay_expected.png`、`diff_heatmap.png`、`diff_graymap.png`、`diff_color_delta.png`、`diff_structure.png` 和 `diff_edges.png` 用来展示支撑父级/模块结论的精细像素证据，但这些像素证据本身不应该被展开成额外报告行。`region_crops/` 会为上报 marker 生成实际图/设计图/diff 的局部裁剪，是确认具体视觉属性最快的入口。
+每次运行还会返回成对的视觉证据。`annotated_actual.png` 和 `annotated_expected.png` 使用相同编号和坐标，方便 agent 直接对照实际图与设计稿。`annotated_depth_*` 展示当前选择的钻取层级，`annotated_raw_*` 展示所有 raw pixel evidence。当源图尺寸不一致时，`annotated_expected.png` 是已经归一化到实际截图坐标系的设计稿；`regions.json.normalization` 会记录原始设计稿尺寸、缩放比例、offset、padding，以及 `cropped: false`。`evidence_overlay_actual.png`、`evidence_overlay_expected.png`、`diff_heatmap.png`、`diff_graymap.png`、`diff_color_delta.png`、`diff_structure.png` 和 `diff_edges.png` 用来展示支撑节点级 issue 的精细像素证据，但这些像素证据本身不应该被展开成额外报告行。`region_crops/` 会为上报 marker 生成实际图/设计图/diff 的局部裁剪，是确认具体视觉属性最快的入口。
 
 ## 项目结构
 

@@ -30,6 +30,10 @@ def run_diff(tmp_path, actual, expected, *extra_args):
     return out_dir, json.loads((out_dir / "regions.json").read_text(encoding="utf-8"))
 
 
+def run_pixel_diff(tmp_path, actual, expected, *extra_args):
+    return run_diff(tmp_path, actual, expected, "--node-mode", "pixel", *extra_args)
+
+
 def run_diff_process(tmp_path, actual, expected, *extra_args):
     out_dir = tmp_path / "report"
     return subprocess.run(
@@ -56,11 +60,325 @@ def save_image(path, color=(255, 255, 255), size=(120, 90)):
     return image
 
 
+def save_nodes(path, nodes):
+    path.write_text(json.dumps({"nodes": nodes}) + "\n", encoding="utf-8")
+    return path
+
+
 def resize_filter():
     try:
         return Image.Resampling.LANCZOS
     except AttributeError:
         return Image.LANCZOS
+
+
+def test_node_json_normalizes_expected_boxes_and_reports_issue(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    save_image(expected_path, size=(100, 50))
+    save_image(actual_path, size=(200, 100))
+    save_nodes(
+        expected_nodes_path,
+        [{"id": "button", "name": "Primary Button", "kind": "control", "bbox": [10, 10, 30, 10]}],
+    )
+    save_nodes(
+        actual_nodes_path,
+        [{"id": "button-runtime", "name": "Primary Button", "kind": "control", "bbox": [24, 20, 60, 20]}],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    assert payload["diff_engine"]["mode"] == "node-first"
+    assert payload["parameters"]["node_mode"] == "auto"
+    expected_button = next(node for node in payload["ui_nodes"]["expected"] if node["id"] == "button")
+    assert expected_button["bbox"] == {"x": 20, "y": 20, "width": 60, "height": 20}
+    issue = payload["actionable_issues"][0]
+    assert issue["target"]["id"] == "button"
+    assert issue["category"] == "position / alignment"
+    assert issue["delta"]["dx"] == 4
+    assert issue["evidence"]["pixel_diff_is_evidence_only"] is True
+    assert payload["reported_regions"][0]["issue"]["issue_id"] == issue["issue_id"]
+
+
+def test_node_diff_reports_child_residual_instead_of_parent(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    save_image(expected_path, size=(200, 140))
+    save_image(actual_path, size=(200, 140))
+    save_nodes(
+        expected_nodes_path,
+        [
+            {"id": "card", "name": "Card", "kind": "container", "bbox": [20, 20, 120, 80]},
+            {"id": "badge", "parent_id": "card", "name": "Badge Icon", "kind": "icon", "bbox": [40, 44, 20, 20]},
+        ],
+    )
+    save_nodes(
+        actual_nodes_path,
+        [
+            {"id": "card-runtime", "name": "Card", "kind": "container", "bbox": [20, 20, 120, 80]},
+            {"id": "badge-runtime", "parent_id": "card-runtime", "name": "Badge Icon", "kind": "icon", "bbox": [46, 44, 20, 20]},
+        ],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    actionable_ids = [issue["target"]["id"] for issue in payload["actionable_issues"]]
+    assert actionable_ids == ["badge"]
+    issue = payload["actionable_issues"][0]
+    assert issue["residual_delta"]["dx"] == 6
+    assert issue["parent_delta"]["dx"] == 0
+
+
+def test_node_diff_suppresses_children_when_parent_shift_explains_them(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    save_image(expected_path, size=(220, 160))
+    save_image(actual_path, size=(220, 160))
+    save_nodes(
+        expected_nodes_path,
+        [
+            {"id": "card", "name": "Card", "kind": "container", "bbox": [30, 30, 120, 80]},
+            {"id": "title", "parent_id": "card", "name": "Title", "kind": "text", "bbox": [48, 48, 60, 16], "text": "Title"},
+            {"id": "icon", "parent_id": "card", "name": "Icon", "kind": "icon", "bbox": [48, 76, 20, 20]},
+        ],
+    )
+    save_nodes(
+        actual_nodes_path,
+        [
+            {"id": "card-runtime", "name": "Card", "kind": "container", "bbox": [38, 30, 120, 80]},
+            {"id": "title-runtime", "parent_id": "card-runtime", "name": "Title", "kind": "text", "bbox": [56, 48, 60, 16], "text": "Title"},
+            {"id": "icon-runtime", "parent_id": "card-runtime", "name": "Icon", "kind": "icon", "bbox": [56, 76, 20, 20]},
+        ],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    assert [issue["target"]["id"] for issue in payload["actionable_issues"]] == ["card"]
+    suppressed = payload["actionable_issues"][0]["suppressed_children"]
+    assert {item["node"] for item in suppressed} == {"title", "icon"}
+
+
+def test_node_diff_reports_missing_and_extra_nodes(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    save_image(expected_path, size=(240, 140))
+    save_image(actual_path, size=(240, 140))
+    save_nodes(
+        expected_nodes_path,
+        [{"id": "expected-only", "name": "Expected Only", "kind": "icon", "bbox": [24, 40, 20, 20]}],
+    )
+    save_nodes(
+        actual_nodes_path,
+        [{"id": "actual-only", "name": "Actual Only", "kind": "control", "bbox": [190, 80, 28, 28]}],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    issue_types = {issue["issue_type"] for issue in payload["actionable_issues"]}
+    assert issue_types == {"missing", "extra"}
+    categories = {issue["category"] for issue in payload["actionable_issues"]}
+    assert categories == {"missing element", "extra element"}
+
+
+def test_node_json_skips_invisible_nodes_and_descendants(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    save_image(expected_path, size=(160, 100))
+    save_image(actual_path, size=(160, 100))
+    save_nodes(
+        expected_nodes_path,
+        [
+            {
+                "id": "hidden-parent",
+                "name": "Hidden Parent",
+                "kind": "container",
+                "bbox": [20, 20, 80, 40],
+                "visible": False,
+                "children": [
+                    {"id": "hidden-child", "name": "Hidden Child", "kind": "icon", "bbox": [28, 28, 16, 16]},
+                ],
+            }
+        ],
+    )
+    save_nodes(actual_nodes_path, [])
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    expected_ids = {node["id"] for node in payload["ui_nodes"]["expected"]}
+    assert "hidden-parent" not in expected_ids
+    assert "hidden-child" not in expected_ids
+    assert payload["actionable_issues"] == []
+
+
+def test_duplicate_node_ids_remap_children_to_unique_parent(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    save_image(expected_path, size=(180, 100))
+    save_image(actual_path, size=(180, 100))
+    save_nodes(
+        expected_nodes_path,
+        [
+            {
+                "name": "Row",
+                "kind": "container",
+                "bbox": [10, 10, 50, 40],
+                "children": [{"name": "Badge", "kind": "icon", "bbox": [20, 20, 12, 12]}],
+            },
+            {
+                "name": "Row",
+                "kind": "container",
+                "bbox": [80, 10, 50, 40],
+                "children": [{"name": "Badge", "kind": "icon", "bbox": [90, 20, 12, 12]}],
+            },
+        ],
+    )
+    save_nodes(actual_nodes_path, [])
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    expected_by_id = {node["id"]: node for node in payload["ui_nodes"]["expected"]}
+    assert expected_by_id["Badge"]["parent_id"] == "Row"
+    assert expected_by_id["Badge-2"]["parent_id"] == "Row-2"
+    assert "Badge-2" in expected_by_id["Row-2"]["children"]
+
+
+def test_local_search_reports_visual_shift_inside_stable_node_box(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+    expected_nodes_path = tmp_path / "expected_nodes.json"
+    actual_nodes_path = tmp_path / "actual_nodes.json"
+
+    expected = save_image(expected_path, size=(120, 90))
+    actual = save_image(actual_path, size=(120, 90))
+    ImageDraw.Draw(expected).rectangle((30, 30, 42, 42), fill=(20, 20, 20))
+    ImageDraw.Draw(actual).rectangle((36, 30, 48, 42), fill=(20, 20, 20))
+    expected.save(expected_path)
+    actual.save(actual_path)
+    save_nodes(
+        expected_nodes_path,
+        [{"id": "icon", "name": "Icon", "kind": "icon", "bbox": [26, 26, 22, 22]}],
+    )
+    save_nodes(
+        actual_nodes_path,
+        [{"id": "icon-runtime", "name": "Icon", "kind": "icon", "bbox": [26, 26, 22, 22]}],
+    )
+
+    _, payload = run_diff(
+        tmp_path,
+        actual_path,
+        expected_path,
+        "--expected-nodes",
+        str(expected_nodes_path),
+        "--actual-nodes",
+        str(actual_nodes_path),
+    )
+
+    issue = payload["actionable_issues"][0]
+    assert issue["target"]["id"] == "icon"
+    assert issue["category"] == "position / alignment"
+    assert issue["delta"]["dx"] == 6
+    assert issue["target"]["box_actual"]["x"] == 32
+    assert issue["evidence"]["node_actual_box"]["x"] == 26
+
+
+def test_large_background_color_diff_is_deferred_visual_issue(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    save_image(expected_path, color=(236, 248, 240), size=(180, 120))
+    save_image(actual_path, color=(210, 235, 225), size=(180, 120))
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path)
+
+    assert payload["actionable_issues"] == []
+    assert payload["deferred_visual_issues"]
+    assert payload["deferred_visual_issues"][0]["category"] == "background color"
+    assert payload["deferred_visual_issues"][0]["evidence"]["pixel_diff_is_evidence_only"] is True
+
+
+def test_screenshot_fallback_reports_shifted_icon_node(tmp_path):
+    expected_path = tmp_path / "expected.png"
+    actual_path = tmp_path / "actual.png"
+
+    expected = save_image(expected_path, size=(160, 120))
+    actual = save_image(actual_path, size=(160, 120))
+    ImageDraw.Draw(expected).rectangle((48, 44, 70, 66), fill=(20, 20, 20))
+    ImageDraw.Draw(actual).rectangle((56, 44, 78, 66), fill=(20, 20, 20))
+    expected.save(expected_path)
+    actual.save(actual_path)
+
+    _, payload = run_diff(tmp_path, actual_path, expected_path)
+
+    assert payload["diff_engine"]["mode"] == "node-first"
+    assert any(node["source_method"] == "expected-screenshot-parser" for node in payload["ui_nodes"]["expected"])
+    assert any(issue["category"] == "position / alignment" for issue in payload["actionable_issues"])
+    assert payload["raw_pixel_regions"]
 
 
 def test_detects_color_spacing_and_icon_differences(tmp_path):
@@ -85,7 +403,7 @@ def test_detects_color_spacing_and_icon_differences(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    out_dir, payload = run_diff(tmp_path, actual_path, expected_path)
+    out_dir, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     assert (out_dir / "annotated_actual.png").exists()
     assert (out_dir / "annotated_expected.png").exists()
@@ -174,7 +492,7 @@ def test_actual_and_expected_annotations_use_matching_coordinates(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    out_dir, payload = run_diff(tmp_path, actual_path, expected_path)
+    out_dir, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
     annotated_actual = Image.open(out_dir / "annotated_actual.png").convert("RGB")
     annotated_expected = Image.open(out_dir / "annotated_expected.png").convert("RGB")
 
@@ -206,7 +524,7 @@ def test_text_like_pixel_changes_are_not_classified_as_content(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--min-area", "4")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--min-area", "4")
 
     assert payload["regions"]
     assert all("content" not in region["category_hint"].lower() for region in payload["regions"])
@@ -239,7 +557,7 @@ def test_parent_module_shift_suppresses_child_regions(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--min-area", "4")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--min-area", "4")
 
     assert payload["audit_order"] == "top-down"
     assert payload["reported_regions"]
@@ -278,7 +596,7 @@ def test_edge_safe_area_difference_is_reported_first(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path)
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     first = payload["reported_regions"][0]
     assert first["level"] == 0
@@ -306,7 +624,7 @@ def test_child_difference_is_reported_when_parent_matches(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path)
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     assert len(payload["reported_regions"]) == 1
     assert payload["suppressed_regions"] == []
@@ -324,7 +642,7 @@ def test_filters_isolated_noise(tmp_path):
     actual.putpixel((42, 20), (0, 0, 0))
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path)
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     assert payload["regions"] == []
 
@@ -340,7 +658,7 @@ def test_low_contrast_color_delta_is_detected_below_rgb_threshold(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path)
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     assert payload["regions"]
     assert all(region["mean_delta"] < payload["parameters"]["threshold"] for region in payload["regions"])
@@ -370,7 +688,7 @@ def test_priority_ranking_prefers_geometry_over_background_color(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path)
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     reported = payload["reported_regions"]
     assert reported
@@ -397,7 +715,7 @@ def test_scales_expected_to_actual_when_dimensions_differ(tmp_path):
     expected.save(expected_path)
     expected.resize((120, 80), resize_filter()).save(actual_path)
 
-    out_dir, payload = run_diff(tmp_path, actual_path, expected_path)
+    out_dir, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     assert payload["regions"] == []
     assert payload["actual_size"] == {"width": 120, "height": 80}
@@ -424,7 +742,7 @@ def test_proportional_fit_pads_expected_without_cropping(tmp_path):
     actual.paste(expected.resize((120, 40), resize_filter()), (0, 20))
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path)
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path)
 
     assert payload["regions"] == []
     assert payload["normalization"]["mode"] == "proportional-fit"
@@ -468,9 +786,9 @@ def test_hierarchy_depth_progressively_includes_deeper_regions(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, shallow_payload = run_diff(tmp_path / "shallow", actual_path, expected_path, "--hierarchy-depth", "1")
-    _, mid_payload = run_diff(tmp_path / "mid", actual_path, expected_path, "--hierarchy-depth", "5")
-    _, deep_payload = run_diff(tmp_path / "deep", actual_path, expected_path, "--hierarchy-depth", "9")
+    _, shallow_payload = run_pixel_diff(tmp_path / "shallow", actual_path, expected_path, "--hierarchy-depth", "1")
+    _, mid_payload = run_pixel_diff(tmp_path / "mid", actual_path, expected_path, "--hierarchy-depth", "5")
+    _, deep_payload = run_pixel_diff(tmp_path / "deep", actual_path, expected_path, "--hierarchy-depth", "9")
 
     assert shallow_payload["parameters"]["hierarchy_depth"] == 1
     assert all(region["display_depth"] <= 1 for region in shallow_payload["reported_regions"])
@@ -506,7 +824,7 @@ def test_depth_mode_keeps_detail_regions_inside_full_screen_edge_parent(tmp_path
     actual_draw.rectangle((48, 44, 64, 60), fill=(250, 250, 250))
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
 
     assert len(payload["reported_regions"]) > 1
     assert any(region["priority_tier"] == 1 for region in payload["reported_regions"])
@@ -533,7 +851,7 @@ def test_hierarchy_depth_five_includes_sparse_icon_edge_regions(tmp_path):
     expected.save(expected_path)
     save_image(actual_path, color=(255, 255, 255), size=(1000, 1000))
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
 
     assert any(
         region["display_depth"] == 5
@@ -554,7 +872,7 @@ def test_hierarchy_policy_describes_depth_mode(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--hierarchy-depth", "5")
 
     assert "hierarchy-depth" in payload["hierarchy_policy"]
     assert "do not hide eligible child detail regions" in payload["hierarchy_policy"]
@@ -573,7 +891,7 @@ def test_report_mode_detail_selects_depth_five(tmp_path):
     expected.save(expected_path)
     save_image(actual_path, color=(255, 255, 255), size=(1000, 1000))
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail")
 
     assert payload["parameters"]["report_mode"] == "detail"
     assert payload["parameters"]["effective_hierarchy_depth"] == 5
@@ -622,7 +940,7 @@ def test_detail_mode_splits_internal_objects_from_broad_parent_regions(tmp_path)
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail", "--min-area", "8")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail", "--min-area", "8")
     reported = payload["reported_regions"]
 
     assert any(
@@ -657,7 +975,7 @@ def test_hierarchy_depth_overrides_report_mode_preset(tmp_path):
     expected.save(expected_path)
     save_image(actual_path, color=(255, 255, 255), size=(1000, 1000))
 
-    _, payload = run_diff(
+    _, payload = run_pixel_diff(
         tmp_path,
         actual_path,
         expected_path,
@@ -689,7 +1007,7 @@ def test_depth_mode_exposes_structured_region_buckets(tmp_path):
     expected.save(expected_path)
     actual.save(actual_path)
 
-    _, payload = run_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail")
+    _, payload = run_pixel_diff(tmp_path, actual_path, expected_path, "--report-mode", "detail")
 
     assert [region["id"] for region in payload["depth_regions"]] == [
         region["id"] for region in payload["reported_regions"]

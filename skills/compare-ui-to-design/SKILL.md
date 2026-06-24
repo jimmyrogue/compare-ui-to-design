@@ -31,13 +31,16 @@ Audit from top to bottom in the UI hierarchy. Start with page-level layout, then
    - If the actual screenshot and design export have different pixel sizes, use the actual screenshot as the coordinate baseline and let `visual_diff.py` proportionally fit the design into that canvas without cropping. Inspect `regions.json.normalization` before judging size, margin, or edge findings.
 
 3. Run automated visual diff when both comparable images are available.
-   - Use `scripts/visual_diff.py`. The helper uses a multi-signal detector: RGB pixel distance, CIE Lab perceptual color distance, local structural dissimilarity, and Sobel edge/stroke delta. Treat the script as stronger evidence than a raw pixel overlay, but still inspect the paired images before writing conclusions.
+   - Use `scripts/visual_diff.py`. The helper is node-first by default: UI node matching and hierarchical attribution make the primary decisions, while RGB/Lab/structure/edge pixel diffs are evidence and debugging inputs.
+   - Prefer passing real node trees when available. Expected/design nodes use expected-image coordinates and are normalized into the actual screenshot coordinate space; actual/runtime nodes use actual screenshot coordinates.
 
    ```bash
    python skills/compare-ui-to-design/scripts/visual_diff.py \
      --actual actual.png \
      --expected expected.png \
-     --out-dir report
+     --out-dir report \
+     --expected-nodes expected-nodes.json \
+     --actual-nodes actual-nodes.json
    ```
 
    - Use stricter or looser options only when the task requires it:
@@ -52,7 +55,8 @@ Audit from top to bottom in the UI hierarchy. Start with page-level layout, then
      --merge-gap 6
    ```
 
-   - Use `--report-mode` when you need to drill into details without waiting for every parent-level issue to be resolved first. Presets are `structure`, `module`, `detail`, and `raw`. Use `--hierarchy-depth 1..9` only when you need finer control; it overrides the preset if both are provided. Detail mode also adds object-level proposals from strong RGB, Lab, structural, and edge signals so image/icon assets, circular controls, and compact icon groups can be marked inside a broader card or row region.
+   - Use `--node-mode pixel` only when you need the legacy pixel-region hierarchy for debugging or compatibility. In `auto` mode, missing node JSON falls back to lightweight screenshot node proposals.
+   - Use `--report-mode` when you need to drill into details without waiting for every parent-level issue to be resolved first. Presets are `structure`, `module`, `detail`, and `raw`. Use `--hierarchy-depth 1..9` only when you need finer control; it overrides the preset if both are provided.
 
    ```bash
    python skills/compare-ui-to-design/scripts/visual_diff.py \
@@ -69,16 +73,17 @@ Audit from top to bottom in the UI hierarchy. Start with page-level layout, then
    - Classify likely differences using `references/audit-rubric.md`.
    - Follow top-down order: page layout -> top-level modules -> nested modules -> element details.
    - Inspect `annotated_actual.png` and `annotated_expected.png` together. They use the same actual/normalized-design coordinates and marker numbers, so compare the actual and design at each matching region before writing conclusions.
-   - In hierarchy-depth mode, inspect `annotated_depth_actual.png` and `annotated_depth_expected.png` for the selected drilldown layer. In detail/raw mode these depth annotations focus on `focus_regions` so parent context boxes do not hide image/icon/control findings. Use `annotated_raw_actual.png` / `annotated_raw_expected.png` when you need every raw candidate region.
-   - When a marker is broad, inspect `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, `diff_graymap.png`, `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` to locate the precise changed pixels that support the parent/module finding.
+   - In hierarchy-depth mode, inspect `annotated_depth_actual.png` and `annotated_depth_expected.png` for the selected drilldown layer. Use `annotated_raw_actual.png` / `annotated_raw_expected.png` when you need every raw pixel-evidence candidate.
+   - Inspect `issues`, `actionable_issues`, `deferred_visual_issues`, `ui_nodes`, and `node_matches` in `regions.json` before writing the report. Use `raw_pixel_regions` only as evidence/debug context.
+   - When a marker is broad, inspect `evidence_overlay_actual.png`, `evidence_overlay_expected.png`, `diff_heatmap.png`, `diff_graymap.png`, `diff_color_delta.png`, `diff_structure.png`, and `diff_edges.png` to locate the precise changed pixels that support the node-level issue.
    - Open the per-region crop pair in `region_crops/` for each reported marker before deciding the exact issue. The crop pair is usually the clearest evidence for small typography, icon, border, radius, color, and alignment problems.
    - Prioritize issues by visual implementation impact, not by raw color area. Use this order unless the user gives a different one: size/layout dimensions, position/alignment, relative relationship/spacing, image or icon consistency, font metrics/typography, foreground color, background color, gradient, then shadow/effects.
    - Report modules, containers, images, icons, borders, typography metrics, spacing, margin, padding, and alignment before color-only and decorative effect differences.
    - Audit screen-edge regions explicitly: top inset, bottom inset, left/right rails, safe-area padding, full-bleed backgrounds, clipped cards, sticky headers/footers, and edge-aligned controls.
-   - Prefer `reported_regions` from `regions.json` for the user-facing report. In drilldown mode, use `focus_regions` and `annotated_depth_*` for the selected detail layer, `depth_regions` for all regions up to the selected preset/depth, `parent_regions` for page/module context, `detail_regions` for inspectable child findings, and `raw_regions` only for debugging.
+   - Prefer `actionable_issues` from `regions.json` for the user-facing report. `reported_regions` and `focus_regions` are issue-backed marker boxes for annotation compatibility. Use `deferred_visual_issues` for background/color/gradient/shadow issues that should not outrank layout/text/icon problems.
    - When a reported region includes `finding_summary`, `review_guidance`, or `edge_evidence`, use those fields as script evidence in the report. Do not dismiss a broad parent/module region as a false positive merely because it groups many child pixel differences.
    - When a reported region includes `priority_tier`, `priority_category`, `element_kind`, `severity_score`, `confidence`, `dominant_signal`, and `diff_signals`, use those fields to prioritize and explain the issue. `element_kind` is a hypothesis, not a final label; verify it against the actual/design crop pair.
-   - When a reported region includes `visual_evidence.diff_pixel_bbox` or `visual_evidence.region_crops`, use it to describe where the fine-grained evidence sits inside the broader marker. The marker is the top-down audit finding; the evidence maps and crops are supporting evidence, not extra report items by themselves. In detail mode, prefer separate image/icon/control child markers when they identify an independent issue inside a broad parent region.
+   - When an issue includes `delta`, `parent_delta`, `residual_delta`, `suppressed_children`, and `evidence`, use those fields to explain whether the fix belongs to a parent layout or a child node. Pixel evidence supports the node diagnosis; it is not the primary decision.
    - If `edge_evidence.touches` includes an edge or `edge_evidence.margins` shows a very small margin such as `right=0px`, explicitly compare that edge against the design. State whether app-owned content is too close to the screen edge, clipped, missing safe-area padding, or using a different full-bleed background.
    - Treat `suppressed_child_count > 0` as evidence that the parent issue explains lower-level noise. Report the parent/root issue first, then inspect suppressed children only for independent icon, image, typography, color, or border problems.
    - Ignore copy-only and data-only differences by default: different labels, counters, timestamps, IDs, names, list items, or backend values are not UI/UX issues unless they change visual layout.
@@ -105,18 +110,18 @@ Evidence overlays: /absolute/path/to/evidence_overlay_actual.png, /absolute/path
 Diff maps: /absolute/path/to/diff_heatmap.png, /absolute/path/to/diff_graymap.png, /absolute/path/to/diff_color_delta.png, /absolute/path/to/diff_structure.png, /absolute/path/to/diff_edges.png
 Region crops: /absolute/path/to/region_crops
 
-| # | Region | Category | Difference |
-|---|---|---|---|
-| 1 | x=120 y=84 w=48 h=20 | Typography Metrics | Actual title renders 14px/medium and sits 3px too high; design appears 16px/semibold. |
-| 2 | x=24 y=308 w=327 h=1 | Border / Color | Divider is #E5E7EB and 1px lower; design uses a lighter #F1F2F4 at y=307. |
-| 3 | x=16 y=144 w=358 h=92 | Module / Spacing | Card width matches, but internal horizontal padding is 12px larger than design. |
-| 4 | x=0 y=0 w=390 h=44 | Edge / Safe Area | Top background stops below the status-bar area; design expects the same color to extend to the screen edge. |
+| # | Target | Region | Category | Difference |
+|---|---|---|---|---|
+| 1 | ProfileCard.badge.icon | x=120 y=84 w=48 h=20 | Position / Alignment | Icon residual dx=5px after parent dx=0px; adjust local padding/gap. |
+| 2 | Header.title | x=24 y=308 w=327 h=24 | Typography Metrics | Text baseline is 3px lower and height is 2px taller than expected. |
+| 3 | ProductCard | x=16 y=144 w=358 h=92 | Size / Layout | Card width is 12px wider; children share the same parent offset. |
+| 4 | AppBackground | x=0 y=0 w=390 h=844 | Deferred Visual | Background color differs, but no structural node issue is attached. |
 
 ## Notes
 - Screenshot size: 390x844.
 - Design normalization: expected image was proportionally fit into the actual screenshot canvas; no cropping was applied.
-- Script evidence for #4: edge margin top=0px; treat this parent/edge region as the primary UI/UX finding, not as a false positive.
-- Prioritization evidence: use priority_tier, priority_category, severity_score, confidence, dominant_signal, and region crop pairs to decide which issues matter most.
+- Script evidence: use `actionable_issues` first; use `deferred_visual_issues` for background/color/gradient/shadow follow-up.
+- Prioritization evidence: use priority_tier, category, severity_score, confidence, delta, parent_delta, residual_delta, suppressed_children, and region crop pairs to decide which issues matter most.
 - Copy-only and live-data differences were ignored unless they affected layout.
 - Device/system UI chrome, dynamic clock, and caret regions were ignored.
 ```
